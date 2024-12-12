@@ -220,25 +220,20 @@ function set_environment() {
 
 function single_install() {
     info "[step 6]: init datanode"
-    # gs_initdb -w $password -D $app/data/single_node --nodename "sgnode" --locale="en_US.UTF-8"
-    gs_initdb -D  $app/data/single_node --nodename=db1
-   
+    gs_initdb -w $password -D $app/data/single_node --nodename "sgnode" --locale="en_US.UTF-8"
     if [ X$port != X$default_port  ]
     then
         sed -i "/^#port =/c\port = $port" $app/data/single_node/postgresql.conf
     fi
-    echo "nvm_directory = '/mnt/pmem1/data4'" | tee -a $app/data/single_node/postgresql.conf
     info "[step 7]: start datanode"
     gs_ctl start -D $app/data/single_node -Z single_node
 }
 
 function init_db() {
     info "[init primary datanode.]"
-    # gs_initdb -D $app/data/master --nodename=datanode1 -E UTF-8 --locale=en_US.UTF-8 -U $user  -w $password
-    gs_initdb -D  $app/data/master --nodename=datanode1
+    gs_initdb -D $app/data/master --nodename=datanode1 -E UTF-8 --locale=en_US.UTF-8 -U $user  -w $password
     info "[init slave datanode.]"
-    gs_initdb -D  $app/data/slave --nodename=datanode1
-    # gs_initdb -D $app/data/slave --nodename=datanode2 -E UTF-8 --locale=en_US.UTF-8 -U $user  -w $password
+    gs_initdb -D $app/data/slave --nodename=datanode2 -E UTF-8 --locale=en_US.UTF-8 -U $user  -w $password
 }
 
 function config_db() {
@@ -258,9 +253,6 @@ function config_db() {
     sed -i "/^#replconninfo1/c\replconninfo1 = 'localhost=${ip_arr[0]} localport=$(($slave_port+1)) localheartbeatport=$(($slave_port+5)) localservice=$(($slave_port+4)) remotehost=${ip_arr[0]} remoteport=$(($port+1)) remoteheartbeatport=$(($port+5)) remoteservice=$(($port+4))'"  $app/data/slave/postgresql.conf
     echo "remote_read_mode = non_authentication" | tee -a $app/data/master/postgresql.conf $app/data/slave/postgresql.conf
     echo "host    all             all             ${ip_arr[0]}/32            trust" | tee -a $app/data/master/pg_hba.conf $app/data/slave/pg_hba.conf
-    echo "host    all             all             0.0.0.0/0            trust" | tee -a $app/data/master/pg_hba.conf $app/data/slave/pg_hba.conf
-    echo "nvm_directory = '/mnt/pmem2/data2'" | tee -a $app/data/master/postgresql.conf
-    echo "nvm_directory = '/mnt/pmem2/data3'" | tee -a $app/data/slave/postgresql.conf
 }
 
 function start_db() {
@@ -403,7 +395,7 @@ function main() {
     info "[step 3]: change_gausshome_owner"
     change_gausshome_owner
     info "[step 4]: set environment variables"
-    # set_environment
+    set_environment
     if [ X$mode == X"single" ]
     then
         single_install

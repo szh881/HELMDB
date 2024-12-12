@@ -296,10 +296,10 @@ NVMDB::Table *NvmGetTableByOid(Oid oid) {
 }
 
 static inline NVMDB::Table *NvmGetTableByOidWrapper(Oid oid) {
-    if (RecoveryInProgress())
-    {
-        BootStrap()
-    }
+    // if (RecoveryInProgress())
+    // {
+    //     BootStrap()
+    // }
 
     auto *table = NvmGetTableByOid(oid);
     if (unlikely(table == nullptr)) {
