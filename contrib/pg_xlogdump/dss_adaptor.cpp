@@ -1,0 +1,1 @@
+/home/szh/helmdb_xx/HELMDB/./src/gausskernel/storage/dss/dss_adaptor.cpp

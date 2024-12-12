@@ -1,0 +1,1 @@
+/home/szh/helmdb_xx/HELMDB/./src/gausskernel/storage/access/rmgrdesc/replorigindesc.cpp
