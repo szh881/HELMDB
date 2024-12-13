@@ -10471,6 +10471,11 @@ void StartupXLOG(void)
                 /* Remember this record as the last-applied one */
                 t_thrd.xlog_cxt.LastRec = t_thrd.xlog_cxt.ReadRecPtr;
 
+
+                /* Replay the NVM data message from the queue */
+                ReplayNVMDataFromQueue();
+
+
                 /* Exit loop if we reached inclusive recovery target */
                 if (!recoveryContinue &&
                     (t_thrd.xlog_cxt.server_mode == PRIMARY_MODE || t_thrd.xlog_cxt.server_mode == NORMAL_MODE ||

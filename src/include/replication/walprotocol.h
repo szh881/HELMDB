@@ -18,6 +18,7 @@
 #include "datatype/timestamp.h"
 #include "replication/replicainternal.h"
 #include "pgxc/barrier.h"
+#include <vector>
 #define XLOG_NAME_LENGTH 24
 
 /*
@@ -49,6 +50,37 @@ typedef struct {
     bool uwal_catchup;
     bool fullSync = false;
 } WalSndrMessage;
+
+#define NVM_TYPE_CREATE 0x0001
+#define NVM_TYPE_INSERT 0x0002
+#define NVM_TYPE_DELETE 0x0004
+#define NVM_TYPE_UPDATE 0x0008
+#define NVM_TABLE_COL_NUM 32
+
+struct NVMColumnDesc {
+    // NVM 数据类型
+    uint32  m_colType;
+    // PG数据类型, 可以和m_colType相互转换
+    uint32 m_colOid;
+    // 类型占用空间
+    uint64 m_colLen;
+    // 这一列在一行中的数据偏移量
+    uint64 m_colOffset;
+    // 是否允许为空
+    bool m_isNotNull;
+    // 列名
+    char m_colName[128];
+};
+
+typedef struct NVMSndMessage
+{
+    int64_t type;
+    int64_t relid;
+    /* for create table */
+    uint32 col_cnt = 0; 
+    uint64 row_len = 0;
+    NVMColumnDesc col_desc[NVM_TABLE_COL_NUM];
+}NVMSndMessage;
 
 /*
  * Refence :PrimaryKeepaliveMessage
@@ -303,7 +335,10 @@ typedef struct HadrReplyMessage {
     uint64 pad4;
 } HadrReplyMessage;
 
-
+extern void NVMDataSend(void);
+extern std::vector<NVMSndMessage> GetNVMDataMessage(void);
+extern void						  PushNVMDataMessage(NVMSndMessage message);
+extern void						  ReplayNVMDataFromQueue(void);
 /*
  * Maximum data payload in a WAL data message.	Must be >= XLOG_BLCKSZ.
  *

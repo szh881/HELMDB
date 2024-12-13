@@ -113,6 +113,8 @@
 #include "postmaster/postmaster.h"
 #include "alarm/alarm.h"
 #include "utils/distribute_test.h"
+// #include "../gausskernel/storage/nvmdb/include/nvm_table.h"
+
 #ifdef ENABLE_BBOX
 #include "gs_bbox.h"
 #endif
@@ -4053,6 +4055,9 @@ static int WalSndLoop(WalSndSendDataCallback send_data, char* xlogPath)
         /* Check for input from the client */
         ProcessRepliesIfAny();
 
+        /* Send NVM data to standby */
+        NVMDataSend();
+
         /* Walsender first startup, send a keepalive to standby, no need reply. */
         if (first_startup) {
             WalSndKeepalive(false);
@@ -5331,6 +5336,46 @@ static void XLogSendLogical(char* xlogPath)
         SpinLockAcquire(&walsnd->mutex);
         walsnd->sentPtr = t_thrd.walsender_cxt.sentPtr;
         SpinLockRelease(&walsnd->mutex);
+    }
+}
+
+/**
+ *  'N' means nvm table's data.
+ */
+#include <vector>
+void
+NVMDataSend(void)
+{
+	errno_t		  errorno = EOK;
+    std::vector<NVMSndMessage> nvmMessageArray = GetNVMDataMessage();
+
+	if (nvmMessageArray.empty())
+        return;
+
+    for (int i = 0; i < nvmMessageArray.size(); i++)
+    {
+        NVMSndMessage nvmMessage = nvmMessageArray[i];
+
+        int64_t type = nvmMessage.type;
+
+        /* Prepend with the message type and send it. */
+        t_thrd.walsender_cxt.output_xlog_message[0] = 'N';
+        if (type & NVM_TYPE_CREATE)
+        {
+            errorno = memcpy_s(
+                    t_thrd.walsender_cxt.output_xlog_message + 1,
+                    sizeof(WalDataMessageHeader) +
+                            g_instance.attr.attr_storage.MaxSendSize * 1024,
+                    &nvmMessage, sizeof(NVMSndMessage));
+            securec_check(errorno, "\0", "\0");
+            (void) pq_putmessage_noblock(
+                    'd', t_thrd.walsender_cxt.output_xlog_message,
+                    sizeof(NVMSndMessage) + 1);
+        }
+
+        /* Flush the keepalive message to standby immediately. */
+        if (pq_flush_if_writable() != 0)
+            WalSndShutdown();
     }
 }
 

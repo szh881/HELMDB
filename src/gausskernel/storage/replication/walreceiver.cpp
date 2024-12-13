@@ -233,6 +233,8 @@ static void WalRecvHadrSendReply();
 #endif
 
 
+static void
+NVMDataReceive(NVMSndMessage nvmReceiveMessage);
 void ProcessWalRcvInterrupts(void)
 {
     /*
@@ -1131,6 +1133,15 @@ static void XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len)
             XLogWalRcvReceive(buf, len, msghdr.dataStart);
             break;
         }
+        case 'N':
+        {
+            CHECK_MSG_SIZE(len, NVMSndMessage , "invalid NVMDataMessage message received from primary");
+            NVMSndMessage nvmReceiveMessage;
+            errorno = memcpy_s(&nvmReceiveMessage, sizeof(NVMSndMessage), buf, sizeof(NVMSndMessage));
+            securec_check(errorno, "\0", "\0");
+            NVMDataReceive(nvmReceiveMessage);
+            break;
+        }
         case 'C': /* Compressed WAL records */
         {
             WalDataMessageHeader msghdr;
@@ -1433,6 +1444,12 @@ static void ProcessReplyFlags(void)
     } else {
         t_thrd.walreceiver_cxt.reply_message->replyFlags &= ~IS_CANCEL_LOG_CTRL;
     }
+}
+
+static void
+NVMDataReceive(NVMSndMessage nvmReceiveMessage)
+{
+   PushNVMDataMessage(nvmReceiveMessage);
 }
 
 /*

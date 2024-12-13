@@ -11,8 +11,34 @@
 #include "utils/numeric.h"
 #include "utils/numeric_gs.h"
 #include "pgstat.h"
+#include "replication/walprotocol.h"
 
 constexpr int NVM_MAX_KEY_COLUMNS = 10U;
+
+
+typedef struct NVMDataPacket
+{
+    /* type */
+    int64_t type;
+    NVMDB::TableDesc  tableDesc;
+	int64_t			tableId;
+	NVMDB::RowId	rowId;
+	std::string tupledata;
+} NVMDataPacket;
+
+/* 控制结构体，包含线程锁*/
+typedef struct NVMControl
+{
+    std::queue<NVMDataPacket> transferNvmQueue;
+    std::queue<NVMSndMessage> nvmSndQueue;
+    std::mutex mtx;
+} NVMControl;
+
+extern NVMControl	*GetNvmControl();
+extern void			 PushNvmTuplePacket(NVMDataPacket packet);
+extern NVMDataPacket PopNvmTuplePacket(void);
+extern std::vector<NVMDataPacket> PopNvmTuplePacketAll(void);
+
 
 namespace NVMDB_FDW {
 

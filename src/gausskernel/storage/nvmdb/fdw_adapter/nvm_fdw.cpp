@@ -27,6 +27,81 @@
 #define LOG(severity) COMPACT_GOOGLE_LOG_ ## severity.stream()
 
 #include <map>
+#include <vector>
+
+/* global variable */
+static NVMControl g_nvmControl;
+
+NVMControl 
+*GetNvmControl()
+{
+    return &g_nvmControl;
+}
+
+NVMSndMessage
+MakeCreateTableMessage(Oid relid,  NVMDB::TableDesc tabledesc)
+{
+    NVMSndMessage message;
+
+    message.type = NVM_TYPE_CREATE;
+    message.relid = relid;
+    message.col_cnt = tabledesc.col_cnt;
+    message.row_len = tabledesc.row_len;
+    memset(message.col_desc, 0, sizeof(NVMDB::ColumnDesc) * NVM_TABLE_COL_NUM);
+    
+    memcpy_s(message.col_desc, sizeof(NVMDB::ColumnDesc) * tabledesc.col_cnt,
+             tabledesc.col_desc, sizeof(NVMDB::ColumnDesc) * tabledesc.col_cnt);
+    
+    return message;
+}
+
+void
+PushNVMDataMessage(NVMSndMessage message)
+{
+    NVMControl *control = GetNvmControl();
+    std::lock_guard<std::mutex> lock(control->mtx);
+    control->nvmSndQueue.push(message);
+}
+
+std::vector<NVMSndMessage>
+GetNVMDataMessage(void)
+{
+	NVMControl *control = GetNvmControl();
+    std::vector<NVMSndMessage> messages;
+
+    std::lock_guard<std::mutex> lock(control->mtx);
+    while (!control->nvmSndQueue.empty()) {
+        NVMSndMessage message;
+        message = control->nvmSndQueue.front();
+        control->nvmSndQueue.pop();
+        messages.push_back(message);
+    }
+    return messages;
+}
+
+namespace NVMDB_FDW {
+static void RedoNVMCreateTableMessage(NVMSndMessage message);
+};
+
+/*
+ * Replay the nvm table from the queue.
+ */
+void
+ReplayNVMDataFromQueue(void)
+{
+    /* get data message from nvm queue */
+    std::vector<NVMSndMessage> messages = GetNVMDataMessage();
+    for (auto &message : messages) {
+        switch (message.type) {
+            case NVM_TYPE_CREATE:
+                NVMDB_FDW::RedoNVMCreateTableMessage(message);
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 
 namespace NVMDB {
 DECLARE_int64(cache_size);
@@ -499,6 +574,10 @@ NVM_ERRCODE CreateTable(CreateForeignTableStmt *stmt, ::TransactionId tid) {
     }
 
     if (likely(ret == NVM_ERRCODE::NVM_SUCCESS)) {  // 使用初始化完毕的 tableDesc 和oid 初始化Table (在内存中)
+        /* push to ringbuffer */
+        NVMSndMessage message = MakeCreateTableMessage(stmt->base.relation->foreignOid, tableDesc);
+        PushNVMDataMessage(message);
+
         table = new (std::nothrow) NVMDB::Table(stmt->base.relation->foreignOid, tableDesc);
         if (likely(table != nullptr)) {
             g_tableMutex.lock();
@@ -2331,6 +2410,11 @@ static TupleTableSlot *NVMExecForeignInsert(EState *estate, ResultRelInfo *resul
         }
     }
 
+    /**
+     *  
+     */
+
+
     // the data has not been insert into NVM for now
     auto rowId = HeapInsert(tx, table, &tuple);
 
@@ -2596,9 +2680,11 @@ void InitNvm() {
 
     if (needInit) {
         LOG(INFO) << "NVMDB begin init.";
+        LOG(INFO) << "NVMDB path is: " << nvmDirPath;
         NVMDB::InitDB(nvmDirPath);
     } else {
         LOG(INFO) << "NVMDB begin bootstrap.";
+        LOG(INFO) << "NVMDB path is: " << nvmDirPath;
         NVMDB::BootStrap(nvmDirPath);
     }
     LOG(INFO) << "From now on, NVMDB can serve requests.";
@@ -2630,3 +2716,51 @@ void InitNvmThread() {
         t_thrd.nvmdb_init = true;
     }
 }
+
+
+
+
+namespace NVMDB_FDW {
+/**
+ * Replay the CREATE TABLE message.  
+ */
+static void
+RedoNVMCreateTableMessage(NVMSndMessage message)
+{
+	NVM_ERRCODE		 ret = NVM_ERRCODE::NVM_SUCCESS;
+	NVMDB::TableDesc tableDesc;
+	NVMDB::Table	*table = nullptr;
+
+	if (!TableDescInit(&tableDesc, message.col_cnt)) {
+        ret = NVM_ERRCODE::NVM_ERRCODE_NO_MEM;
+        goto final;
+    }
+
+    /* Init table colums describe */
+    memcpy_s(tableDesc.col_desc, sizeof(NVMDB::ColumnDesc) * message.col_cnt,
+             message.col_desc, sizeof(NVMDB::ColumnDesc) * message.col_cnt);
+
+	table = new (std::nothrow)
+			NVMDB::Table(message.relid, tableDesc);
+	if (likely(table != nullptr))
+	{
+		g_tableMutex.lock();
+		g_nvmdbTable.Insert(std::make_pair(message.relid, table));	 // 插入 g_nvmdbTable 中(同样非持久化)
+		g_tableMutex.unlock();
+		g_nvmdbTableLocal.Insert(std::make_pair(message.relid, table));  // 本地缓存一份
+		uint32 tableSegHead = table->CreateSegment();  // 在PMEM中初始化表
+		NVMDB::g_heapSpace->CreateTable(message.relid, tableSegHead);
+	}
+	else
+	{
+		ret = NVM_ERRCODE::NVM_ERRCODE_NO_MEM;
+	}
+
+final:
+    if (ret != NVM_ERRCODE::NVM_SUCCESS) {
+        TableDescDestroy(&tableDesc);
+        ereport(ERROR, (errmodule(MOD_NVM), errcode(ERRCODE_INVALID_COLUMN_DEFINITION), errmsg("NVM create table fail:%s!", NvmGetErrcodeStr(ret))));
+    }
+}
+
+};
