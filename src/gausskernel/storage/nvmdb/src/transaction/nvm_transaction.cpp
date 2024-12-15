@@ -3,6 +3,19 @@
 #include "transaction/nvm_snapshot.h"
 #include <unistd.h>
 
+
+#include <sys/syscall.h>
+
+uint64_t
+GetCurrentTransactionXid(void)
+{
+	uint64_t xid = 0;
+   pid_t threadId = (pid_t)syscall(SYS_gettid);
+   /* threadid + time as unique id, c language get time*/
+    xid = (uint64_t)threadId << 32 | (uint64_t)time(NULL);
+     return xid;
+}
+
 namespace NVMDB {
 
 thread_local std::unique_ptr<Transaction> t_txContext = nullptr;
@@ -50,6 +63,8 @@ void Transaction::Begin() {
     // 全局最小的snapshot CSN, 低于这个CSN的交易一定已经完成执行
     m_minSnapshot = m_processArray->getGlobalMinCSN();
     m_txStatus = TxStatus::IN_PROGRESS;
+
+    SetXid(GetCurrentTransactionXid());
 }
 
 void Transaction::Commit() {

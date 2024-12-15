@@ -2,6 +2,16 @@
 #include "heap/nvm_heap.h"
 #include "heap/nvm_rowid_map.h"
 
+#undef LOG
+#include "postgres.h"
+#include "datatypes.h"
+#include "nodes/bitmapset.h"
+#include "pgxc/locator.h"
+#include "nodes/relation.h"
+#include "nodes/nodes.h"
+#include "nodes/relation.h"
+#include "access/xact.h"
+#include "access/transam.h"
 namespace NVMDB {
 
 uint32 Table::CreateSegment() {

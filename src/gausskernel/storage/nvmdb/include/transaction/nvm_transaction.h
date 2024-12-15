@@ -72,6 +72,10 @@ public:
         return m_txStatus;
     }
 
+    void SetTxStatus(TxStatus status) {
+        m_txStatus = status;
+    }
+
     [[nodiscard]] TxSlotPtr GetTxSlotLocation() const {
         return m_txSlotPtr;
     }
@@ -116,6 +120,9 @@ public:
     // For testing only
     inline uint64 GetSnapshot() const { return m_snapshotCSN; }
 
+    inline void SetXid (uint64 xid) { m_xid = xid; }
+    inline uint64 GetXid (void) { return m_xid; }
+
 protected:
     void PrepareIndexInsertUndo(const Key_t &key);
 
@@ -136,6 +143,8 @@ private:
 
     // 小于m_minSnapshot的Undo不会再被读或写, 可以被安全回收
     uint64 m_minSnapshot;
+
+    uint64 m_xid;
 
     // 事务当前的状态
     TxStatus m_txStatus;

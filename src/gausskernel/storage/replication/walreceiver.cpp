@@ -1449,7 +1449,11 @@ static void ProcessReplyFlags(void)
 static void
 NVMDataReceive(NVMSndMessage nvmReceiveMessage)
 {
-   PushNVMDataMessage(nvmReceiveMessage);
+    PushNVMDataMessage(nvmReceiveMessage);
+
+    WakeupRecovery();
+    WakeupDataRecovery();
+    wakeupWalRcvWriter();
 }
 
 /*

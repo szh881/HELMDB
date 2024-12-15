@@ -8,6 +8,7 @@
 #undef LOG
 
 #include "access/reloptions.h"
+// #include "access/transam.h"
 #include "commands/copy.h"
 #include "commands/explain.h"
 #include "commands/vacuum.h"
@@ -19,6 +20,7 @@
 #include "parser/parsetree.h"
 #include "access/sysattr.h"
 #include "storage/ipc.h"
+#include "replication/walsender.h"
 
 // 重新定义 google log
 #undef LOG
@@ -31,6 +33,16 @@
 
 /* global variable */
 static NVMControl g_nvmControl;
+
+namespace NVMDB_FDW {
+static void RedoNVMCreateTableMessage(NVMSndMessage message);
+static void
+RedoNVMInsertMessage(NVMSndMessage message);
+static void CopyNVMColumnDataToMessage(NVMSerializeColumn *col_data,
+									   Datum value, Oid typid);
+static void
+RedoNVMCommitMessage(NVMSndMessage message);
+};
 
 NVMControl 
 *GetNvmControl()
@@ -55,12 +67,59 @@ MakeCreateTableMessage(Oid relid,  NVMDB::TableDesc tabledesc)
     return message;
 }
 
+
+NVMSndMessage
+MakeInsertMessage(uint32 xid, Oid relid, int nattrs, TupleTableSlot *slot)
+{
+    NVMSndMessage message = {0};
+    TupleDesc tupdesc = slot->tts_tupleDescriptor;
+
+    message.type = NVM_TYPE_INSERT;
+    message.relid = relid;
+    message.col_cnt = nattrs;
+    message.xid = xid;
+
+    /* deal with each column */
+	for (uint64_t i = 0, j = 1; i < nattrs; i++, j++)
+	{
+		bool isnull = false;
+		Datum value = heap_slot_getattr(slot, j, &isnull);
+
+		if (!isnull)
+		{
+			NVMDB_FDW::CopyNVMColumnDataToMessage(&message.col_data[i], value,
+									  tupdesc->attrs[i].atttypid);
+            
+            message.col_data[i].isNull = false;
+		}
+		else
+		{
+            message.col_data[i].isNull = true;
+		}
+	}
+
+	return message;
+}
+
+NVMSndMessage
+MakeCommitMessage(uint32 xid)
+{
+    NVMSndMessage message = {0};
+
+    message.type = NVM_TYPE_COMMIT;
+    message.xid = xid;
+
+    return message;
+}
+
 void
 PushNVMDataMessage(NVMSndMessage message)
 {
     NVMControl *control = GetNvmControl();
     std::lock_guard<std::mutex> lock(control->mtx);
     control->nvmSndQueue.push(message);
+
+    WalSndWakeup();
 }
 
 std::vector<NVMSndMessage>
@@ -79,9 +138,6 @@ GetNVMDataMessage(void)
     return messages;
 }
 
-namespace NVMDB_FDW {
-static void RedoNVMCreateTableMessage(NVMSndMessage message);
-};
 
 /*
  * Replay the nvm table from the queue.
@@ -96,12 +152,33 @@ ReplayNVMDataFromQueue(void)
             case NVM_TYPE_CREATE:
                 NVMDB_FDW::RedoNVMCreateTableMessage(message);
                 break;
+            case NVM_TYPE_INSERT:
+            {
+                NVMDB_FDW::RedoNVMInsertMessage(message);
+                break;
+            }
+            case NVM_TYPE_DELETE:
+                break;
+            case NVM_TYPE_UPDATE:
+                break;
+            case NVM_TYPE_COMMIT:
+            {
+                NVMDB_FDW::RedoNVMCommitMessage(message);
+                break;
+            }
+            break;
+
             default:
                 break;
         }
     }
 }
 
+// uint64_t
+// GetNextTransactionXid(void)
+// {
+//     return GetNewObjectId(false);
+// }
 
 namespace NVMDB {
 DECLARE_int64(cache_size);
@@ -613,6 +690,20 @@ NVMDB::Transaction *NVMGetCurrentTxContext() {
     return u_sess->nvm_cxt.m_nvmTx;
 }
 
+/*
+ * Only used in the case of recovery.
+ */
+NVMDB::Transaction *
+NVMCreateTxContext()
+{
+	NVMDB::Transaction *tx;
+	tx = new NVMDB::Transaction();
+
+    tx->Begin();
+    // tx->SetXid(0);
+	return tx;
+}
+
 void NVMStateFree(NVMFdwState *nvmState) {
     if (nvmState != nullptr) {
         delete nvmState->mIter;
@@ -710,6 +801,44 @@ void NVMColInitData(NVMDB::RAMTuple &tuple, uint16 colIndex, Datum datum, Oid at
             tuple.SetCol(colIndex, (char *)&datum);
             break;
     }
+}
+
+void
+RedoNVMColInitData(NVMDB::RAMTuple &tuple, uint16 colIndex,
+				   NVMSerializeColumn col, Oid atttypid)
+{
+	switch (atttypid)
+	{
+		case BYTEAOID:
+		case TEXTOID:
+		case VARCHAROID:
+		case CLOBOID:
+		case BPCHAROID:
+		{
+			bytea *txt = (bytea *)col.colData;
+			uint32 size = VARSIZE(txt);
+			size -= sizeof(uint32);
+			errno_t ret = memcpy_s(txt, sizeof(uint32), &size, sizeof(uint32));
+			SecureRetCheck(ret);
+			tuple.SetCol(colIndex, (char *) txt, size + sizeof(uint32));
+			SET_VARSIZE(txt, size + sizeof(uint32));
+			break;
+		}
+		case NUMERICOID:
+		{
+			tuple.SetCol(colIndex, (char *) col.colData, col.colLen);
+			break;
+		}
+		case INTERVALOID:
+		case TINTERVALOID:
+		case TIMETZOID:
+			tuple.SetCol(colIndex, col.colData);
+			break;
+		default:
+			tuple.SetCol(colIndex, col.colData);
+			break;
+	}
+	return;
 }
 
 void NVMColUpdateData(NVMDB::RAMTuple &tuple, uint16 colIndex, Datum datum, Oid atttypi, uint64 len) {
@@ -2411,14 +2540,17 @@ static TupleTableSlot *NVMExecForeignInsert(EState *estate, ResultRelInfo *resul
     }
 
     /**
-     *  
+     * Make the insert message for the standby to redo the operation.
      */
-
+    NVMSndMessage message = MakeInsertMessage(tx->GetXid(), RelationGetRelid(resultRelInfo->ri_RelationDesc), nvmState->mNumAttrs, slot);
 
     // the data has not been insert into NVM for now
     auto rowId = HeapInsert(tx, table, &tuple);
 
     NVMDB_FDW::NVMInsertTuple2AllIndex(tx, table, &tuple, rowId);
+
+    /* Here we push the message to SendQueue. */
+    PushNVMDataMessage(message);
 
     return slot;
 }
@@ -2592,6 +2724,9 @@ static void NVMXactCallback(XactEvent event, void *arg) {
         trans->Begin();
     } else if (event == XACT_EVENT_COMMIT) {
         trans->Commit();
+
+        NVMSndMessage message =  MakeCommitMessage(trans->GetXid());
+        PushNVMDataMessage(message);
     } else if (event == XACT_EVENT_ABORT) {
         trans->Abort();
     }
@@ -2717,10 +2852,126 @@ void InitNvmThread() {
     }
 }
 
-
-
-
 namespace NVMDB_FDW {
+
+#include <map>
+std::map<Oid, NVMDB::Transaction *> g_nvmTxMap;
+
+/* if not exist, insert, othersize check the value must same */
+void
+NvmInsertTxMap(Oid key, NVMDB::Transaction *value)
+{
+	auto iter = g_nvmTxMap.find(key);
+	if (iter == g_nvmTxMap.end())
+	{
+		g_nvmTxMap.insert(std::make_pair(key, value));
+	}
+	else
+	{
+		if (iter->second != value)
+		{
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("NVMDB_FDW: TxMap insert error!")));
+		}
+	}
+}
+
+NVMDB::Transaction *
+NvmGetTxByXid(Oid key)
+{
+	auto iter = g_nvmTxMap.find(key);
+	if (iter == g_nvmTxMap.end())
+	{
+		return nullptr;
+	}
+	return iter->second;
+}
+
+void 
+NvmRemoveTxMap(Oid key)
+{
+    auto iter = g_nvmTxMap.find(key);
+    if (iter != g_nvmTxMap.end())
+    {
+        g_nvmTxMap.erase(iter);
+    }
+}
+
+static void
+CopyNVMColumnDataToMessage(NVMSerializeColumn *col_data, Datum value, Oid typid)
+{
+    col_data->colOid = typid;
+	switch (typid)
+	{
+		case BYTEAOID:
+		case TEXTOID:
+		case VARCHAROID:
+		case CLOBOID:
+		case BPCHAROID:
+		{
+			bytea *txt = DatumGetByteaP(value);
+            uint32 size = VARSIZE(txt);
+            memcpy_s(col_data->colData, 1024, txt, size);
+            col_data->colLen = size;
+			break;
+		}
+		case NUMERICOID:
+		{
+			Numeric n = DatumGetNumeric(value);
+			char	buf[DECIMAL_MAX_SIZE];
+			auto   *d = (NVMDB_FDW::DecimalSt *) buf;
+
+            /* Never should be happen */
+			if (NUMERIC_NDIGITS(n) > NVMDB_FDW::DECIMAL_MAX_DIGITS)
+			{
+				ereport(ERROR, (errmodule(MOD_NVM),
+								errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+								errmsg("Value exceeds maximum precision: %d",
+									   NVMDB_FDW::NVM_NUMERIC_MAX_PRECISION)));
+				break;
+			}
+            NVMDB_FDW::PGNumericToNVM(n, *d);
+
+            col_data->colLen = DECIMAL_SIZE(d);
+            memcpy_s(col_data->colData, 1024, d, col_data->colLen);
+
+			break;
+		}
+		case INTERVALOID:
+            memcpy_s(col_data->colData, 1024, (char *)value, 16);
+            break;
+		case TINTERVALOID:
+            memcpy_s(col_data->colData, 1024, (char *)value, 12);
+            break;
+		case TIMETZOID:
+            memcpy_s(col_data->colData, 1024, (char *)value, 12);
+			break;
+		case INT2OID:
+            memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(int16));
+            col_data->colLen = sizeof(int16);
+            break;
+        case INT4OID:
+            memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(int32));
+            col_data->colLen = sizeof(int32);
+            break;
+        case INT8OID:
+            memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(int64));
+            col_data->colLen = sizeof(int64);
+			break;
+        case FLOAT4OID:
+            memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(float4));
+            col_data->colLen = sizeof(float4);
+            break;
+        case FLOAT8OID:
+            memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(float8));
+            col_data->colLen = sizeof(float8);
+            break;
+        default:
+            ereport(ERROR, (errmodule(MOD_NVM), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                            errmsg("NVMDB_FDW: unsupported column type: %d", typid)));
+            break;
+	}
+}
 /**
  * Replay the CREATE TABLE message.  
  */
@@ -2735,7 +2986,8 @@ RedoNVMCreateTableMessage(NVMSndMessage message)
         ret = NVM_ERRCODE::NVM_ERRCODE_NO_MEM;
         goto final;
     }
-
+    tableDesc.col_cnt = message.col_cnt;
+    tableDesc.row_len = message.row_len;
     /* Init table colums describe */
     memcpy_s(tableDesc.col_desc, sizeof(NVMDB::ColumnDesc) * message.col_cnt,
              message.col_desc, sizeof(NVMDB::ColumnDesc) * message.col_cnt);
@@ -2763,4 +3015,64 @@ final:
     }
 }
 
-};
+static void
+RedoNVMInsertMessage(NVMSndMessage message)
+{
+    auto *tx = NVMDB_FDW::NVMGetCurrentTxContext();
+
+    /* Reset transaction status */
+    tx->SetTxStatus(NVMDB::TxStatus::IN_PROGRESS);
+   
+    /* TODO */
+    // NVMDB::Transaction *tx11 = NVMDB_FDW::NvmGetTxByXid(message.xid);
+    // if (tx11 == nullptr)
+    // {
+    //     tx11 = NVMDB_FDW::NVMCreateTxContext();
+	// 	tx11->SetXid(message.xid);
+	// 	NvmInsertTxMap(tx11->GetXid(), tx11);
+	// }
+
+	auto *table = NVMDB_FDW::NvmGetTableByOidWrapper(message.relid);
+
+    NVMDB::RAMTuple tuple(table->GetColDesc(), table->GetRowLen());
+
+	for (int i = 0; i < message.col_cnt; i++)
+	{
+		if (!message.col_data[i].isNull)
+		{
+			NVMDB_FDW::RedoNVMColInitData(tuple, i, message.col_data[i],
+									  message.col_data[i].colOid);
+			tuple.SetNull(i, false);
+		}
+		else
+		{
+			tuple.SetNull(i, true);
+		}
+	}
+    auto rowId = HeapInsert(tx, table, &tuple);
+
+    NVMDB_FDW::NVMInsertTuple2AllIndex(tx, table, &tuple, rowId);
+}
+
+static void
+RedoNVMCommitMessage(NVMSndMessage message)
+{
+    Assert(message.xid != InvalidTransactionId);
+
+    /* TODO: for starup thread map multi primary thread */
+    // NVMDB::Transaction *tx = NVMDB_FDW::NvmGetTxByXid(message.xid);
+	// if (tx == nullptr)
+	// {
+	// 	return;
+	// }
+
+    auto *tx = NVMDB_FDW::NVMGetCurrentTxContext();
+
+    if (tx->GetTxStatus() == NVMDB::TxStatus::IN_PROGRESS)
+    {
+        tx->Commit();
+    }
+
+    NvmRemoveTxMap(message.xid);
+}
+};  // namespace NVMDB_FDW

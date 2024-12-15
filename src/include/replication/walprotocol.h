@@ -55,6 +55,7 @@ typedef struct {
 #define NVM_TYPE_INSERT 0x0002
 #define NVM_TYPE_DELETE 0x0004
 #define NVM_TYPE_UPDATE 0x0008
+#define NVM_TYPE_COMMIT 0x0010
 #define NVM_TABLE_COL_NUM 32
 
 struct NVMColumnDesc {
@@ -72,12 +73,28 @@ struct NVMColumnDesc {
     char m_colName[128];
 };
 
+struct NVMSerializeColumn {
+    uint32 colOid;
+    uint64 colLen;
+    char colData[1024];
+    bool isNull;
+    char colName[128];
+};
+
 typedef struct NVMSndMessage
 {
-    int64_t type;
+	uint64	xid;
+	int64_t type;
     int64_t relid;
-    /* for create table */
+    /* the total columns number */
     uint32 col_cnt = 0; 
+
+    /* for insert tuple */
+    NVMSerializeColumn col_data[NVM_TABLE_COL_NUM];
+
+    /* for update */
+
+    /* for create table */
     uint64 row_len = 0;
     NVMColumnDesc col_desc[NVM_TABLE_COL_NUM];
 }NVMSndMessage;

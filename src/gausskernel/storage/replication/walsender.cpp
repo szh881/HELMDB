@@ -5360,18 +5360,19 @@ NVMDataSend(void)
 
         /* Prepend with the message type and send it. */
         t_thrd.walsender_cxt.output_xlog_message[0] = 'N';
-        if (type & NVM_TYPE_CREATE)
-        {
-            errorno = memcpy_s(
-                    t_thrd.walsender_cxt.output_xlog_message + 1,
-                    sizeof(WalDataMessageHeader) +
-                            g_instance.attr.attr_storage.MaxSendSize * 1024,
-                    &nvmMessage, sizeof(NVMSndMessage));
-            securec_check(errorno, "\0", "\0");
-            (void) pq_putmessage_noblock(
-                    'd', t_thrd.walsender_cxt.output_xlog_message,
-                    sizeof(NVMSndMessage) + 1);
-        }
+
+		int sendSize = std::max(
+				sizeof(WalDataMessageHeader) +
+						g_instance.attr.attr_storage.MaxSendSize * 1024,
+				sizeof(NVMSndMessage));
+
+		errorno = memcpy_s(t_thrd.walsender_cxt.output_xlog_message + 1,
+						   sendSize, &nvmMessage, sizeof(NVMSndMessage));
+		securec_check(errorno, "\0", "\0");
+        (void) pq_putmessage_noblock(
+                'd', t_thrd.walsender_cxt.output_xlog_message,
+                sizeof(NVMSndMessage) + 1);
+
 
         /* Flush the keepalive message to standby immediately. */
         if (pq_flush_if_writable() != 0)
@@ -5402,6 +5403,8 @@ static void XLogSendPhysical(char* xlogPath)
     bool got_recptr = false;
     volatile HaShmemData *hashmdata = t_thrd.postmaster_cxt.HaShmData;
     errno_t errorno = EOK;
+
+    NVMDataSend();
 
     t_thrd.walsender_cxt.catchup_threshold = 0;
     if (SS_STREAM_CLUSTER && xlogPath != NULL) {
@@ -7674,7 +7677,7 @@ static int WalSndTimeout()
     } else if (walsnd->sendRole == SNDROLE_PRIMARY_BUILDSTANDBY) {
         return MULTIPLE_TIME * t_thrd.walsender_cxt.timeoutCheckInternal;
     } else {
-        return t_thrd.walsender_cxt.timeoutCheckInternal;
+        return std::min(t_thrd.walsender_cxt.timeoutCheckInternal, 10);
     }
 }
 
