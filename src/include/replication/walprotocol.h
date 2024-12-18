@@ -81,6 +81,12 @@ struct NVMSerializeColumn {
     char colName[128];
 };
 
+struct NVMRowId
+{
+	uint32 rowId;
+	uint16 m_reserve;
+};
+
 typedef struct NVMSndMessage
 {
 	uint64	xid;
@@ -93,6 +99,8 @@ typedef struct NVMSndMessage
     NVMSerializeColumn col_data[NVM_TABLE_COL_NUM];
 
     /* for update */
+    NVMRowId old_rowid;
+    uint8 bitmap[16];
 
     /* for create table */
     uint64 row_len = 0;

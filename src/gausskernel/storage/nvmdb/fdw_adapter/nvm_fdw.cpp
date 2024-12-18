@@ -42,6 +42,8 @@ static void CopyNVMColumnDataToMessage(NVMSerializeColumn *col_data,
 									   Datum value, Oid typid);
 static void
 RedoNVMCommitMessage(NVMSndMessage message);
+static void
+RedoNVMUpdateMessage(NVMSndMessage message);
 };
 
 NVMControl 
@@ -102,6 +104,44 @@ MakeInsertMessage(uint32 xid, Oid relid, int nattrs, TupleTableSlot *slot)
 }
 
 NVMSndMessage
+MakeUpdateMessage(uint32 xid, Oid relid, int nattrs, uint32 rowId, uint8 *bitmap, TupleTableSlot *slot)
+{
+    NVMSndMessage message = {0};
+    TupleDesc tupdesc = slot->tts_tupleDescriptor;
+
+    message.type = NVM_TYPE_UPDATE;
+    message.relid = relid;
+    message.col_cnt = nattrs;
+    message.xid = xid;
+    message.old_rowid.rowId = rowId;
+    memcpy_s(message.bitmap, 16, bitmap, BITMAP_GETLEN(nattrs));
+
+    /* deal with each column */
+	for (uint64_t i = 0, j = 1; i < nattrs; i++, j++)
+	{
+		if (BITMAP_GET(bitmap, i))
+		{
+			bool  isnull = false;
+			Datum value = heap_slot_getattr(slot, j, &isnull);
+			if (!isnull)
+			{
+				NVMDB_FDW::CopyNVMColumnDataToMessage(
+						&message.col_data[i], value,
+						tupdesc->attrs[i].atttypid);
+
+				message.col_data[i].isNull = false;
+			}
+			else
+			{
+				message.col_data[i].isNull = true;
+			}
+		}
+	}
+	return message;
+}
+
+
+NVMSndMessage
 MakeCommitMessage(uint32 xid)
 {
     NVMSndMessage message = {0};
@@ -160,6 +200,7 @@ ReplayNVMDataFromQueue(void)
             case NVM_TYPE_DELETE:
                 break;
             case NVM_TYPE_UPDATE:
+               NVMDB_FDW::RedoNVMUpdateMessage(message);
                 break;
             case NVM_TYPE_COMMIT:
             {
@@ -839,6 +880,43 @@ RedoNVMColInitData(NVMDB::RAMTuple &tuple, uint16 colIndex,
 			break;
 	}
 	return;
+}
+
+void
+RedoNVMColUpdateData(NVMDB::RAMTuple &tuple, uint16 colIndex,
+					 NVMSerializeColumn col, Oid atttypid, int len)
+{
+    switch (atttypid)
+    {
+        case BYTEAOID:
+        case TEXTOID:
+        case VARCHAROID:
+        case CLOBOID:
+        case BPCHAROID:
+        {
+            bytea *txt = (bytea *)col.colData;
+            uint32 size = VARSIZE(txt);
+            size -= sizeof(uint32);
+            errno_t ret = memcpy_s(txt, sizeof(uint32), &size, sizeof(uint32));
+            SecureRetCheck(ret);
+            tuple.UpdateColInc(colIndex, (char *) txt, size + sizeof(uint32));
+            SET_VARSIZE(txt, size + sizeof(uint32));
+            break;
+        }
+        case NUMERICOID:
+        {
+            tuple.UpdateColInc(colIndex, (char *) col.colData, col.colLen);
+            break;
+        }
+        case INTERVALOID:
+        case TINTERVALOID:
+        case TIMETZOID:
+            tuple.UpdateColInc(colIndex, col.colData, len);
+            break;
+        default:
+            tuple.UpdateColInc(colIndex, col.colData, len);
+            break;
+    }
 }
 
 void NVMColUpdateData(NVMDB::RAMTuple &tuple, uint16 colIndex, Datum datum, Oid atttypi, uint64 len) {
@@ -2609,6 +2687,8 @@ static TupleTableSlot *NVMExecForeignUpdate(EState *estate, ResultRelInfo *resul
         ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("NVM Update fail(%d)!", static_cast<int>(ret3))));
     }
 
+    NVMSndMessage message = MakeUpdateMessage(fdwState->mCurrTx->GetXid(), RelationGetRelid(resultRelInfo->ri_RelationDesc), num, (uint32)rowId.m_rowId, fdwState->mAttrsModified,  planSlot);
+
     std::vector<bool> indexColChange(table->GetIndexCount(), false);
     for (uint64 i = 0; i < num; i++) {
         if (BITMAP_GET(fdwState->mAttrsModified, i)) {
@@ -2629,6 +2709,7 @@ static TupleTableSlot *NVMExecForeignUpdate(EState *estate, ResultRelInfo *resul
         }
     }
 
+	PushNVMDataMessage(message);
     if (resultRelInfo->ri_projectReturning) {
         return planSlot;
     }
@@ -2939,12 +3020,15 @@ CopyNVMColumnDataToMessage(NVMSerializeColumn *col_data, Datum value, Oid typid)
 		}
 		case INTERVALOID:
             memcpy_s(col_data->colData, 1024, (char *)value, 16);
+            col_data->colLen = 16;
             break;
 		case TINTERVALOID:
             memcpy_s(col_data->colData, 1024, (char *)value, 12);
+            col_data->colLen = 12;
             break;
 		case TIMETZOID:
             memcpy_s(col_data->colData, 1024, (char *)value, 12);
+            col_data->colLen = 12;
 			break;
 		case INT2OID:
             memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(int16));
@@ -2957,6 +3041,10 @@ CopyNVMColumnDataToMessage(NVMSerializeColumn *col_data, Datum value, Oid typid)
         case INT8OID:
             memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(int64));
             col_data->colLen = sizeof(int64);
+			break;
+        case TIMESTAMPOID:
+            memcpy_s(col_data->colData, 1024, (char *)&value, 8);
+            col_data->colLen = 8;
 			break;
         case FLOAT4OID:
             memcpy_s(col_data->colData, 1024, (char *)&value, sizeof(float4));
@@ -3053,6 +3141,52 @@ RedoNVMInsertMessage(NVMSndMessage message)
 
     NVMDB_FDW::NVMInsertTuple2AllIndex(tx, table, &tuple, rowId);
 }
+
+static void
+RedoNVMUpdateMessage(NVMSndMessage message)
+{
+    auto *tx = NVMDB_FDW::NVMGetCurrentTxContext();
+    auto *table = NVMDB_FDW::NvmGetTableByOidWrapper(message.relid);
+
+    NVMDB::RAMTuple tuple(table->GetColDesc(), table->GetRowLen());
+
+    tx->Begin();
+
+    auto ret = NVMDB::HeapRead(tx, table, message.old_rowid.rowId, &tuple);
+    if (ret != NVMDB::HamStatus::OK)
+    {
+        ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                        errmsg("REdo Update NVM Update fail(%d)!", static_cast<int>(ret))));
+    }
+
+    NVMDB::RAMTuple tupleOrg(table->GetColDesc(), table->GetRowLen());
+    tupleOrg.CopyRow(tuple);
+
+    for (int i = 0; i < message.col_cnt; i++)
+    {
+        if (BITMAP_GET(message.bitmap, i))
+        {
+            if (!message.col_data[i].isNull)
+            {
+                NVMDB_FDW::RedoNVMColUpdateData(tuple, i, message.col_data[i],
+                                            message.col_data[i].colOid, table->GetColDesc()[i].m_colLen);
+                tuple.SetNull(i, false);
+            }
+            else
+            {
+                tuple.SetNull(i, true);
+            }
+        }
+    }
+
+    auto ret2 = NVMDB::HeapUpdate(tx, table, message.old_rowid.rowId, &tuple);
+    if (ret2 != NVMDB::HamStatus::OK)
+    {
+        ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                        errmsg("NVM Update fail(%d)!", static_cast<int>(ret2))));
+    }
+}
+
 
 static void
 RedoNVMCommitMessage(NVMSndMessage message)
