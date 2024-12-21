@@ -44,6 +44,8 @@ static void
 RedoNVMCommitMessage(NVMSndMessage message);
 static void
 RedoNVMUpdateMessage(NVMSndMessage message);
+static void
+RedoNVMDeleteMessage(NVMSndMessage message);
 };
 
 NVMControl 
@@ -140,6 +142,20 @@ MakeUpdateMessage(uint32 xid, Oid relid, int nattrs, uint32 rowId, uint8 *bitmap
 	return message;
 }
 
+NVMSndMessage
+MakeDeleteMessage(uint32 xid, Oid relid, int nattrs, uint32 rowId)
+{
+    NVMSndMessage message = {0};
+
+    message.type = NVM_TYPE_DELETE;
+    message.relid = relid;
+    message.col_cnt = nattrs;
+    message.xid = xid;
+    message.old_rowid.rowId = rowId;
+
+	return message;
+}
+
 
 NVMSndMessage
 MakeCommitMessage(uint32 xid)
@@ -198,10 +214,15 @@ ReplayNVMDataFromQueue(void)
                 break;
             }
             case NVM_TYPE_DELETE:
+            {
+                NVMDB_FDW::RedoNVMDeleteMessage(message);
                 break;
+            }
             case NVM_TYPE_UPDATE:
-               NVMDB_FDW::RedoNVMUpdateMessage(message);
-                break;
+            {
+				NVMDB_FDW::RedoNVMUpdateMessage(message);
+				break;
+			}
             case NVM_TYPE_COMMIT:
             {
                 NVMDB_FDW::RedoNVMCommitMessage(message);
@@ -2751,6 +2772,9 @@ static TupleTableSlot *NVMExecForeignDelete(EState *estate, ResultRelInfo *resul
         ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("NVM Delete fail(%d)!", static_cast<int>(ret3))));
     }
 
+    NVMSndMessage message = MakeDeleteMessage(fdwState->mCurrTx->GetXid(), RelationGetRelid(resultRelInfo->ri_RelationDesc), num, (uint32)rowId.m_rowId);
+    PushNVMDataMessage(message);
+
     NVMDB_FDW::NVMDeleteTupleFromAllIndex(fdwState->mCurrTx, fdwState->mTable, &tuple, rowId.m_rowId);
 
     if (resultRelInfo->ri_projectReturning) {
@@ -3184,6 +3208,31 @@ RedoNVMUpdateMessage(NVMSndMessage message)
     {
         ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                         errmsg("NVM Update fail(%d)!", static_cast<int>(ret2))));
+    }
+}
+
+static void
+RedoNVMDeleteMessage(NVMSndMessage message)
+{
+    auto *tx = NVMDB_FDW::NVMGetCurrentTxContext();
+    auto *table = NVMDB_FDW::NvmGetTableByOidWrapper(message.relid);
+
+    NVMDB::RAMTuple tuple(table->GetColDesc(), table->GetRowLen());
+
+    tx->Begin();
+
+    auto ret = NVMDB::HeapRead(tx, table, message.old_rowid.rowId, &tuple);
+    if (ret != NVMDB::HamStatus::OK)
+    {
+        ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                        errmsg("NVM Delete fail(%d)!", static_cast<int>(ret))));
+    }
+
+    auto ret2 = NVMDB::HeapDelete(tx, table, message.old_rowid.rowId);
+    if (ret2 != NVMDB::HamStatus::OK)
+    {
+        ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                        errmsg("NVM Delete fail(%d)!", static_cast<int>(ret2))));
     }
 }
 
