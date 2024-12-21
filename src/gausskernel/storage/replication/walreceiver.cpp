@@ -1446,14 +1446,18 @@ static void ProcessReplyFlags(void)
     }
 }
 
+// static int receive_count = 0;
 static void
 NVMDataReceive(NVMSndMessage nvmReceiveMessage)
 {
+
     PushNVMDataMessage(nvmReceiveMessage);
+    // receive_count++;
+
+    // elog (WARNING, "NVMDataReceive receive_count %d", receive_count);
 
     WakeupRecovery();
     WakeupDataRecovery();
-    wakeupWalRcvWriter();
 }
 
 /*
@@ -1596,7 +1600,8 @@ void XLogWalRcvReceive(char *buf, Size nbytes, XLogRecPtr recptr)
  */
 void XLogWalRcvSendReply(bool force, bool requestReply)
 {
-    char buf[sizeof(StandbyReplyMessage) + 1] = {0};
+    // char buf[sizeof(StandbyReplyMessage) + 1] = {0};
+    char *buf = (char *)palloc0(sizeof(StandbyReplyMessage) + 1);
     TimestampTz now;
     XLogRecPtr receivePtr = InvalidXLogRecPtr;
     XLogRecPtr writePtr = InvalidXLogRecPtr;
@@ -1720,9 +1725,11 @@ void XLogWalRcvSendReply(bool force, bool requestReply)
                              (uint32)t_thrd.walreceiver_cxt.reply_message->apply)));
     }
 
+    StandbyReplyMessage reply_message = *t_thrd.walreceiver_cxt.reply_message;
+
     /* Prepend with the message type and send it. */
     buf[0] = 'r';
-    rc = memcpy_s(&buf[1], sizeof(StandbyReplyMessage), t_thrd.walreceiver_cxt.reply_message,
+    rc = memcpy_s(&buf[1], sizeof(StandbyReplyMessage), &reply_message,
                   sizeof(StandbyReplyMessage));
     securec_check(rc, "\0", "\0");
     (WalReceiverFuncTable[GET_FUNC_IDX]).walrcv_send(buf, sizeof(StandbyReplyMessage) + 1);

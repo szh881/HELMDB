@@ -261,11 +261,15 @@ function config_db() {
     echo "host    all             all             0.0.0.0/0            trust" | tee -a $app/data/master/pg_hba.conf $app/data/slave/pg_hba.conf
     echo "nvm_directory = '/mnt/pmem2/data2'" | tee -a $app/data/master/postgresql.conf
     echo "nvm_directory = '/mnt/pmem2/data3'" | tee -a $app/data/slave/postgresql.conf
+   
+    # echo "log_destination = 'csvlog'" | tee -a $app/data/master/postgresql.conf
+    # echo "log_destination = 'csvlog'" | tee -a $app/data/slave/postgresql.conf
 }
 
 function start_db() {
     info "[start primary datanode.]"
     gs_ctl start -D $app/data/master -M primary
+    # gs_ctl start -D $app/data/master -M primary -l $app/data/primay.log
     info "[build and start slave datanode.]"
     gs_ctl build -D $app/data/slave  -b full
 }

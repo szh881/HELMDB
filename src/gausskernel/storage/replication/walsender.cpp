@@ -4056,7 +4056,8 @@ static int WalSndLoop(WalSndSendDataCallback send_data, char* xlogPath)
         ProcessRepliesIfAny();
 
         /* Send NVM data to standby */
-        NVMDataSend();
+		if (!pq_is_send_pending())
+			NVMDataSend();
 
         /* Walsender first startup, send a keepalive to standby, no need reply. */
         if (first_startup) {
@@ -4195,7 +4196,9 @@ static int WalSndLoop(WalSndSendDataCallback send_data, char* xlogPath)
                         WalSndSyncDummyStandbyDone(false);
                 }
             }
-        } else {
+            if (!pq_is_send_pending())
+                NVMDataSend();
+		} else {
             /*
              * If we don't have any pending data in the output buffer, try to send
              * some more.  If there is some, we don't bother to call XLogSend
@@ -4217,6 +4220,9 @@ static int WalSndLoop(WalSndSendDataCallback send_data, char* xlogPath)
                                          (uint32)t_thrd.walsender_cxt.sentPtr)));
                 }
             }
+
+            if (!pq_is_send_pending())
+                NVMDataSend();
         }
         LogCtrlSleep();
         /* Try to flush pending output to the client */
@@ -5342,11 +5348,17 @@ static void XLogSendLogical(char* xlogPath)
 /**
  *  'N' means nvm table's data.
  */
+// static int send_count = 0;
 #include <vector>
 void
 NVMDataSend(void)
 {
+    // int cur_send_count = 0;
 	errno_t		  errorno = EOK;
+
+    if (RecoveryInProgress())
+        return;
+
     std::vector<NVMSndMessage> nvmMessageArray = GetNVMDataMessage();
 
 	if (nvmMessageArray.empty())
@@ -5373,11 +5385,11 @@ NVMDataSend(void)
                 'd', t_thrd.walsender_cxt.output_xlog_message,
                 sizeof(NVMSndMessage) + 1);
 
+        // send_count++;
+        // cur_send_count++;
 
-        /* Flush the keepalive message to standby immediately. */
-        if (pq_flush_if_writable() != 0)
-            WalSndShutdown();
     }
+    // elog(WARNING, "NVMDataSend send_count=[%d]], cur_send_count=[%d]", send_count,cur_send_count );
 }
 
 /*
@@ -5404,7 +5416,7 @@ static void XLogSendPhysical(char* xlogPath)
     volatile HaShmemData *hashmdata = t_thrd.postmaster_cxt.HaShmData;
     errno_t errorno = EOK;
 
-    NVMDataSend();
+    // NVMDataSend();
 
     t_thrd.walsender_cxt.catchup_threshold = 0;
     if (SS_STREAM_CLUSTER && xlogPath != NULL) {

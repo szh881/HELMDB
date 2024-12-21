@@ -168,6 +168,10 @@ MakeCommitMessage(uint32 xid)
     return message;
 }
 
+/* Only fro debug test */
+// static uint64 push_count = 0;
+// static uint64 pop_count = 0;
+
 void
 PushNVMDataMessage(NVMSndMessage message)
 {
@@ -175,12 +179,15 @@ PushNVMDataMessage(NVMSndMessage message)
     std::lock_guard<std::mutex> lock(control->mtx);
     control->nvmSndQueue.push(message);
 
+    // elog(WARNING, "PushNVMDataMessage: push_count[%lu], current queue size is [%lu]", ++push_count,  control->nvmSndQueue.size());
+
     WalSndWakeup();
 }
 
 std::vector<NVMSndMessage>
 GetNVMDataMessage(void)
 {
+    // int cur_pop = 0;
 	NVMControl *control = GetNvmControl();
     std::vector<NVMSndMessage> messages;
 
@@ -190,7 +197,14 @@ GetNVMDataMessage(void)
         message = control->nvmSndQueue.front();
         control->nvmSndQueue.pop();
         messages.push_back(message);
+        
+        // pop_count++;
+        // cur_pop++;
     }
+
+	// if (cur_pop > 0)
+	// 	elog(WARNING, "GetNVMDataMessage: pop_count=[%lu], cur_pop=[%lu]", pop_count, cur_pop);
+
     return messages;
 }
 
@@ -2830,8 +2844,12 @@ static void NVMXactCallback(XactEvent event, void *arg) {
     } else if (event == XACT_EVENT_COMMIT) {
         trans->Commit();
 
-        NVMSndMessage message =  MakeCommitMessage(trans->GetXid());
-        PushNVMDataMessage(message);
+       if (!RecoveryInProgress())
+       {
+		   NVMSndMessage message = MakeCommitMessage(trans->GetXid());
+		   PushNVMDataMessage(message);
+       }
+
     } else if (event == XACT_EVENT_ABORT) {
         trans->Abort();
     }
@@ -3174,7 +3192,10 @@ RedoNVMUpdateMessage(NVMSndMessage message)
 
     NVMDB::RAMTuple tuple(table->GetColDesc(), table->GetRowLen());
 
-    tx->Begin();
+    if (tx->GetTxStatus() == NVMDB::TxStatus::COMMITTED)
+    {
+		tx->Begin();
+	}
 
     auto ret = NVMDB::HeapRead(tx, table, message.old_rowid.rowId, &tuple);
     if (ret != NVMDB::HamStatus::OK)
@@ -3219,7 +3240,10 @@ RedoNVMDeleteMessage(NVMSndMessage message)
 
     NVMDB::RAMTuple tuple(table->GetColDesc(), table->GetRowLen());
 
-    tx->Begin();
+    if (tx->GetTxStatus() == NVMDB::TxStatus::COMMITTED)
+    {
+		tx->Begin();
+	}
 
     auto ret = NVMDB::HeapRead(tx, table, message.old_rowid.rowId, &tuple);
     if (ret != NVMDB::HamStatus::OK)
