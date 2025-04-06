@@ -397,7 +397,7 @@ endif()
 
 if("${ENABLE_NVMDB}" STREQUAL "ON")
     list(APPEND gaussdb_LINK_DIRS ${TBB_LIB_PATH} ${PMDK_LIB_PATH} ${CMAKE_BINARY_DIR}/lib)
-    list(APPEND gaussdb_LINK_LIBS stdc++fs tbb ndctl daxctl pmemobj pmem numa glog gflags ibverbs) # rpma
+    list(APPEND gaussdb_LINK_LIBS stdc++fs tbb ndctl daxctl pmemobj pmem numa glog gflags ibverbs zmq protobuf) # rpma
 endif()
 
 if("${SUPPORT_HOTPATCH}" STREQUAL "yes")

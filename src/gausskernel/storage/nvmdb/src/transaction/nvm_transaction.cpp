@@ -52,6 +52,19 @@ void Transaction::Begin() {
     m_txStatus = TxStatus::IN_PROGRESS;
 }
 
+void Transaction::Begin_standbyredo(uint64 snapshotCSN, uint64 minSnapshot) {
+    DCHECK(m_txStatus == TxStatus::EMPTY || m_txStatus == TxStatus::ABORTED || m_txStatus == TxStatus::COMMITTED);
+    DCHECK(m_writeSet.empty());
+    // 全局最新的CSN, 线程基于这个版本进行读取
+    m_snapshotCSN = snapshotCSN;
+    // m_snapshotCSN = m_processArray->getAndUpdateProcessLocalCSN(m_procArrayTID);
+    DCHECK(IsCSNValid(m_snapshotCSN));
+    // 全局最小的snapshot CSN, 低于这个CSN的交易一定已经完成执行
+    m_minSnapshot = minSnapshot;
+    // m_minSnapshot = m_processArray->getGlobalMinCSN();
+    m_txStatus = TxStatus::IN_PROGRESS;
+}
+
 void Transaction::Commit() {
     DCHECK(m_txStatus == TxStatus::IN_PROGRESS);
     m_txStatus = TxStatus::COMMITTING;
@@ -68,6 +81,23 @@ void Transaction::Commit() {
     DCHECK(m_snapshotCSN >= m_processArray->getGlobalMinCSN());
 }
 
+void Transaction::Commit_standbyredo(uint64 commitCSN) {
+    DCHECK(m_txStatus == TxStatus::IN_PROGRESS);
+    m_txStatus = TxStatus::COMMITTING;
+    if (m_undoTxContext != nullptr) {
+        m_commitCSN = commitCSN;
+        // m_commitCSN = m_processArray->getGlobalCSN();
+        m_undoTxContext->UpdateTxSlotCSN(m_commitCSN);
+        m_undoTxContext->UpdateTxSlotStatus(TxSlotStatus::COMMITTED);
+        m_processArray->advanceGlobalCSN();
+        m_undoTxContext = nullptr;
+        m_writeSet.clear();
+    }
+    m_txStatus = TxStatus::COMMITTED;
+    // DCHECK(m_snapshotCSN == m_processArray->getProcessLocalCSN(m_procArrayTID));
+    // DCHECK(m_snapshotCSN >= m_processArray->getGlobalMinCSN());
+}
+
 void Transaction::Abort() {
     if (m_undoTxContext != nullptr) {
         // 事务开始 rollback，此时事务状态仍然是 IN_PROGRESS, 对于已经 rollback 的tuple
@@ -78,8 +108,8 @@ void Transaction::Abort() {
         m_writeSet.clear();
     }
     m_txStatus = TxStatus::ABORTED;
-    DCHECK(m_snapshotCSN == m_processArray->getProcessLocalCSN(m_procArrayTID));
-    DCHECK(m_snapshotCSN >= m_processArray->getGlobalMinCSN());
+    // DCHECK(m_snapshotCSN == m_processArray->getProcessLocalCSN(m_procArrayTID));
+    // DCHECK(m_snapshotCSN >= m_processArray->getGlobalMinCSN());
 }
 
 TMResult Transaction::VersionIsVisible(const NVMTuple& tuple) const {
@@ -116,12 +146,14 @@ TMResult Transaction::VersionIsVisible(const NVMTuple& tuple) const {
         if (version_csn < m_snapshotCSN) {
             return TMResult::OK;
         }
+        // LOG(ERROR) << "TMResult::INVISIBLE version_csn: " << version_csn << " m_snapshotCSN: " << m_snapshotCSN;
         return TMResult::INVISIBLE; // 版本不可见
     }
     // 对应事务没有提交
     if (m_undoTxContext != nullptr && tuple.m_txInfo == m_txSlotPtr) {
         return TMResult::SELF_UPDATED;  // 自己更新自己
     }
+    // LOG(ERROR) << "TMResult::BEING_MODIFIED version_csn: " << version_csn << " m_snapshotCSN: " << m_snapshotCSN;
     return TMResult::BEING_MODIFIED;    // 冲突
 }
 

@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+message Neworder_m
+{
+    int32 w_id_arg_m=1;
+    int32 d_id_arg_m=2;
+    int32 c_id_arg_m=3;
+    int32 o_ol_cnt_arg_m=4;
+    int32 o_all_local_arg_m=5;
+    repeated int32 itemid_m=6;
+    repeated int32 supware_m=7;
+    repeated int32 qty_m=8;
+}

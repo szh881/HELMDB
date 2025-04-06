@@ -1,4 +1,7 @@
 #include "tpcc.h"
+#include <zmq.h>
+#include "Person.pb.h"
+#include "Message.pb.h"
 #include "nvm_init.h"
 #include "nvm_access.h"
 #include "nvmdb_thread.h"
@@ -9,9 +12,84 @@
 #include <getopt.h>
 #include <thread>
 #include <unordered_set>
+#include <queue>
+#include <chrono>
+#include <mutex>
+#include <condition_variable>
+#include <iostream>
+#include <iomanip>
+#include <ctime>
+#include <thread>
+#include <vector>
+using namespace std;
 
 namespace NVMDB {
 namespace TPCC {
+    volatile bool standbyredo_on_working;
+    volatile bool recv_on_working;
+    volatile bool sort_on_working;
+    volatile bool turn_to_master;
+    volatile bool need_always_toif;
+    atomic<int> recv_message_before{0};
+    atomic<int> recv_message_after{0};
+    atomic<int> redo_neworder_num_1{0};
+    atomic<int> redo_neworder_num_2{0};
+    atomic<int> redo_payment_num_1{0};
+    atomic<int> redo_payment_num_2{0};
+    atomic<int> redo_ordstat_num_1{0};
+    atomic<int> redo_ordstat_num_2{0};
+    atomic<int> redo_delivery_num_1{0};
+    atomic<int> redo_delivery_num_2{0};
+    atomic<int> redo_stocklevel_num_1{0};
+    atomic<int> redo_stocklevel_num_2{0};
+    atomic<int> redo_all_num_1{0};
+    atomic<int> redo_all_num_2{0};
+template<typename T>
+class ConcurrentQueue {
+private:
+    std::queue<T> queue;
+    mutable std::mutex mutex;
+    std::condition_variable cond_var;
+
+public:
+    // 入队操作
+    void push(const T& value) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            queue.push(value);
+        }
+        cond_var.notify_one();
+    }
+
+    // 出队操作
+    bool pop(T& value) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (queue.empty()) return false;  // 非阻塞弹出
+        value = queue.front();
+        queue.pop();
+        return true;
+    }
+
+    bool pop_all(std::vector<T>& values, size_t max_count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (queue.empty()) return false;  // 非阻塞弹出
+        size_t count = 0;
+        while (!queue.empty() && count < max_count) {
+            values.push_back(queue.front());
+            queue.pop();
+            ++count;
+        }
+        return !values.empty();
+    }
+
+    // 检查队列是否为空
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return queue.empty();
+    }
+};
+ConcurrentQueue<string> message_queue;
+ConcurrentQueue<All_tx_redolog> sorted_message_queue[4];
 
 /* hardwired. */
 #ifdef NDEBUG
@@ -1096,7 +1174,7 @@ public:
 
     int ordstat(int w_id_arg,     /* warehouse id */
                 int d_id_arg,     /* district id */
-                int byname,       /* select by c_id or c_last? */
+                bool byname,       /* select by c_id or c_last? */
                 int c_id_arg,     /* customer id */
                 char c_last_arg[] /* customer last name, format? */
     ) {
@@ -1894,23 +1972,859 @@ public:
         LOG(INFO) << "finish all consistency check";
     }
 
-    void RunBench() {
-        if (type == 1 || type == 3) {
-            std::thread worker_tids[workers];
-            on_working = true;
-            for (uint32_t i = 0; i < workers; i++) {
-                worker_tids[i] = std::thread(&TPCCBench::tpcc_q, this, i);
-            }
-            sleep(run_time);
-            on_working = false;
-            for (int i = 0; i < workers; i++)
-                worker_tids[i].join();
+    int redo_neword(int w_id_arg,        /* warehouse id */
+               int d_id_arg,        /* district id */
+               int c_id_arg,        /* customer id */
+               int o_ol_cnt_arg,    /* number of items */
+               int o_all_local_arg, /* are all order lines local */
+               int itemid[],        /* ids of items to be ordered */
+               int supware[],       /* warehouses supplying items */
+               int qty[],            /* quantity of each item */
+               uint64 snapshotCSN,
+               uint64 minSnapshot,
+               uint64 commitCSN
+    ) {
+        int w_id = w_id_arg;
+        int d_id = d_id_arg;
+        int c_id = c_id_arg;
+        int o_ol_cnt = o_ol_cnt_arg;
+        int o_all_local = o_all_local_arg;
+        /* next available order id of this district */
+        int d_next_o_id;
+        /* update value */
+        int u_d_next_o_id;
+        uint64 o_entry_d = __rdtsc();
+        const int o_carrier_id = 0;
+        const uint64 ol_delivery_d = 0;
 
-            printTpccStat();
+        STACK_WAREHOUSE(wh);
+        WAREHOUSE_INDEX(whit);
+        STACK_CUSTOMER(cus);
+        CUSTOMER_INDEX(cusit);
+        STACK_DISTRICT(dis);
+        DISTRICT_INDEX(disit);
+        STACK_ORDER(order);
+        ORDER_INDEX(orderit);
+        ORDER_SEC_INDEX(ord_secit);
+        STACK_NEWORDER(neworder);
+        NEWORDER_INDEX(neworderit);
+        STACK_ITEM(item);
+        ITEM_INDEX(itemit);
+        STACK_STOCK(stock);
+        STOCK_INDEX(stockit);
+        STACK_ORDERLINE(orderline);
+        ORDERLINE_INDEX(orderlineit);
+
+        auto tx = GetCurrentTxContext();
+        tx->Begin_standbyredo(snapshotCSN, minSnapshot);
+
+        /* select from warehouse */
+        SET_INDEX_COL(whit, pk, w_id, w_id);
+        SelectTuple(tx, TABLE_WAREHOUSE, &whit, &wh);
+
+        /* select from customer */
+        SET_INDEX_COL(cusit, pk, c_id, c_id);
+        SET_INDEX_COL(cusit, pk, c_d_id, d_id);
+        SET_INDEX_COL(cusit, pk, c_w_id, w_id);
+        SelectTuple(tx, TABLE_CUSTOMER, &cusit, &cus);
+
+        /* update district set d_next_o_id += 1 */
+        RowId disid;
+        SET_INDEX_COL(disit, pk, d_id, d_id);
+        SET_INDEX_COL(disit, pk, d_w_id, w_id);
+        SelectTuple(tx, TABLE_DISTRICT, &disit, &dis, &disid);
+        FETCH_COL(dis, d_next_o_id, d_next_o_id);
+        u_d_next_o_id = d_next_o_id + 1;
+        UPDATE_COL(dis, d_next_o_id, u_d_next_o_id);
+        if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_DISTRICT)], disid, &dis) != HamStatus::OK) {
+            tx->Abort();
+            return -1;
         }
-        check_consistency();
+
+        /* insert into orders (8 columns, others NULL) */
+        SET_COL(order, o_id, d_next_o_id);
+        SET_COL(order, o_w_id, w_id);
+        SET_COL(order, o_d_id, d_id);
+        SET_COL(order, o_c_id, c_id);
+        SET_COL(order, o_entry_d, o_entry_d);
+        SET_COL(order, o_carrier_id, o_carrier_id);
+        SET_COL(order, o_ol_cnt, o_ol_cnt);
+        SET_COL(order, o_all_local, o_all_local);
+
+        InsertTupleWithIndex(tx, TABLE_ORDER, &orderit, &order, &ord_secit);
+
+        /* insert into neworder (3 columns, others NULL) */
+        SET_COL(neworder, no_o_id, d_next_o_id);
+        SET_COL(neworder, no_w_id, w_id);
+        SET_COL(neworder, no_d_id, d_id);
+        InsertTupleWithIndex(tx, TABLE_NEWORDER, &neworderit, &neworder);
+
+        // loop
+        char iname[MAX_NUM_ITEMS][MAX_ITEM_LEN];
+        char bg[MAX_NUM_ITEMS];
+        float amt[MAX_NUM_ITEMS];
+        float price[MAX_NUM_ITEMS];
+
+        for (int ol_number = 1; ol_number <= o_ol_cnt; ol_number++) {
+            int ol_number_idx = ol_number - 1;
+            int ol_supply_w_id = supware[ol_number_idx];
+            if (ol_supply_w_id != w_id)
+                DCHECK(o_all_local == 0);
+            int ol_i_id = itemid[ol_number_idx];
+            int ol_quantity = qty[ol_number_idx];
+            /* select from item  */
+            SET_INDEX_COL(itemit, pk, i_id, ol_i_id);
+            if (!SelectTuple(tx, TABLE_ITEM, &itemit, &item, nullptr, false)) {
+                DCHECK(ol_i_id == notfound);
+                tx->Abort();
+                return -1;
+            }
+
+            float total = 0.0;
+            int s_quantity;
+            price[ol_number_idx] = GET_COL_FLOAT(item, i_price);
+            strncpy(iname[ol_number_idx], GET_COL(item, i_name), 25);
+
+            RowId stockid;
+            SET_INDEX_COL(stockit, pk, s_w_id, ol_supply_w_id);
+            SET_INDEX_COL(stockit, pk, s_i_id, ol_i_id);
+            /* select from stock */
+            SelectTuple(tx, TABLE_STOCK, &stockit, &stock, &stockid);
+
+            FETCH_COL(stock, s_quantity, s_quantity);
+            if (strstr(GET_COL(item, i_data), "original") != nullptr &&
+                strstr(GET_COL(stock, s_data), "original") != nullptr)
+                bg[ol_number_idx] = 'B';
+            else
+                bg[ol_number_idx] = 'G';
+            if (s_quantity > ol_quantity)
+                s_quantity = s_quantity - ol_quantity;
+            else
+                s_quantity = s_quantity - ol_quantity + 91;
+
+            int ol_amount;
+            ol_amount = ol_quantity * GET_COL_FLOAT(item, i_price) *
+                        (1 + GET_COL_FLOAT(wh, w_tax) + GET_COL_FLOAT(dis, d_tax)) *
+                        (1 - GET_COL_FLOAT(cus, c_discount));
+            amt[ol_number_idx] = ol_amount;
+            total += ol_amount;
+
+            /* update stock */
+            UPDATE_COL(stock, s_quantity, s_quantity);
+            if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_STOCK)], stockid, &stock) != HamStatus::OK) {
+                tx->Abort();
+                return -1;
+            }
+
+            /* insert order_line (9 columns, others NULL) */
+            SET_COL(orderline, ol_o_id, d_next_o_id);
+            SET_COL(orderline, ol_w_id, w_id);
+            SET_COL(orderline, ol_d_id, d_id);
+            SET_COL(orderline, ol_number, ol_number);
+            SET_COL(orderline, ol_i_id, ol_i_id);
+            SET_COL(orderline, ol_supply_w_id, ol_supply_w_id);
+            SET_COL(orderline, ol_delivery_d, ol_delivery_d);
+            SET_COL(orderline, ol_quantity, ol_quantity);
+            SET_COL(orderline, ol_amount, ol_amount);
+            /* pick correct s_dist_xx */
+            pick_dist_info(stock, GET_COL(orderline, ol_dist_info), d_id);  // pick correct s_dist_xx
+            InsertTupleWithIndex(tx, TABLE_ORDERLINE, &orderlineit, &orderline);
+        }
+
+        tx->Commit_standbyredo(commitCSN);
+        return 0;
     }
-};
+
+    int redo_payment(int w_id_arg,                                
+                int d_id_arg,                                 
+                bool byname,                                  
+                int c_w_id_arg, int c_d_id_arg, int c_id_arg, 
+                char c_last_arg[],                            
+                float h_amount_arg,
+                uint64 snapshotCSN, uint64 minSnapshot, uint64 commitCSN) {
+        const int w_id = w_id_arg;
+        const int d_id = d_id_arg;
+        const int c_id = c_id_arg;
+        const int c_d_id = c_d_id_arg;
+        const int c_w_id = c_w_id_arg;
+        const float h_amount = h_amount_arg;
+
+        STACK_WAREHOUSE(wh);
+        WAREHOUSE_INDEX(whit);
+        STACK_DISTRICT(dis);
+        DISTRICT_INDEX(disit);
+        STACK_CUSTOMER(cus);
+        CUSTOMER_INDEX(cusit);
+        STACK_HISTORY(hist);
+
+        int64 w_ytd;
+        int64 d_ytd;
+        uint64 h_date = __rdtsc();
+        int64 i_h_amount = h_amount;
+
+        auto tx = GetCurrentTxContext();
+        tx->Begin_standbyredo(snapshotCSN, minSnapshot);
+
+        /* select/update warehouse w_ytd += h_amount */
+        RowId whid;
+        SET_INDEX_COL(whit, pk, w_id, w_id);
+        SelectTuple(tx, TABLE_WAREHOUSE, &whit, &wh, &whid);
+        FETCH_COL(wh, w_ytd, w_ytd);
+        w_ytd += (int)h_amount;
+        UPDATE_COL(wh, w_ytd, w_ytd);
+        if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_WAREHOUSE)], whid, &wh) != HamStatus::OK) {
+            // cout<<"payment 1"<<endl;
+            tx->Abort();
+            return -1;
+        }
+
+        /* select/update district d_ytd += h_amount */
+        RowId disid;
+        SET_INDEX_COL(disit, pk, d_id, d_id);
+        SET_INDEX_COL(disit, pk, d_w_id, w_id);
+        SelectTuple(tx, TABLE_DISTRICT, &disit, &dis, &disid);
+        FETCH_COL(dis, d_ytd, d_ytd);
+        d_ytd += (int)h_amount;
+        UPDATE_COL(dis, d_ytd, d_ytd);
+        if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_DISTRICT)], disid, &dis) != HamStatus::OK) {
+            // cout<<"payment 2"<<endl;
+            tx->Abort();
+            return -1;
+        }
+
+        RowId cusid;
+        if (byname) {
+            /* select customer by last name */
+            if (!SelectCustomerByName(tx, c_w_id, d_id, c_last_arg, cusid, cus)) {
+                /* should never happen */
+                tx->Abort();
+                return -1;
+            }
+        } else {
+            /* select customer by id */
+            SET_INDEX_COL(cusit, pk, c_id, c_id);
+            SET_INDEX_COL(cusit, pk, c_d_id, d_id);
+            SET_INDEX_COL(cusit, pk, c_w_id, c_w_id);
+            SelectTuple(tx, TABLE_CUSTOMER, &cusit, &cus, &cusid);
+        }
+
+        float c_balance = GET_COL_FLOAT(cus, c_balance) - h_amount;
+        if (strstr(GET_COL(cus, c_credit), "BC")) {
+            char datetime[TIMESTAMP_LEN + 1];
+            char *c_new_data = GET_COL(cus, c_data);
+
+            gettimestamp(datetime, TIMESTAMP_LEN);
+            snprintf(c_new_data, 501, "| %4d %2d %4d %2d %4d $%7.2f %.12s %.24s", c_id, c_d_id, c_w_id, d_id, w_id,
+                     h_amount, datetime, GET_COL(cus, c_data));
+            strncat(c_new_data, GET_COL(cus, c_data), 500 - strlen(c_new_data));
+        }
+
+        /* update customer */
+        UPDATE_COL(cus, c_balance, c_balance);
+        if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_CUSTOMER)], cusid, &cus) != HamStatus::OK) {
+            // cout<<"payment 3"<<endl;
+            tx->Abort();
+            return -1;
+        }
+
+        /* insert into history (8 columns) */
+        char *h_data = GET_COL(hist, h_data);
+        strncpy(h_data, GET_COL(wh, w_name), 10);
+        h_data[10] = '\0';
+        strncat(h_data, GET_COL(dis, d_name), 10);
+        h_data[20] = ' ';
+        h_data[21] = ' ';
+        h_data[22] = ' ';
+        h_data[23] = ' ';
+        h_data[24] = '\0';
+        SET_COL(hist, h_c_id, c_id);
+        SET_COL(hist, h_d_id, d_id);
+        SET_COL(hist, h_w_id, w_id);
+        SET_COL(hist, h_amount, i_h_amount);
+        SET_COL(hist, h_c_d_id, c_d_id);
+        SET_COL(hist, h_c_w_id, c_w_id);
+        SET_COL(hist, h_date, h_date);
+        InsertTupleWithIndex(tx, TABLE_HISTORY, nullptr, &hist);
+        tx->Commit_standbyredo(commitCSN);
+        return 0;
+    }
+
+    int redo_ordstat(int w_id_arg,     /* warehouse id */
+                int d_id_arg,     /* district id */
+                bool byname,       /* select by c_id or c_last? */
+                int c_id_arg,     /* customer id */
+                char c_last_arg[], /* customer last name, format? */
+                uint64 snapshotCSN,
+                uint64 minSnapshot,
+                uint64 commitCSN
+    ) {
+        int w_id = w_id_arg;
+        int d_id = d_id_arg;
+        int c_id = c_id_arg;
+        int c_d_id = d_id;
+        int c_w_id = w_id;
+
+        STACK_CUSTOMER(cus);
+        CUSTOMER_INDEX(cusit);
+        STACK_ORDER(order);
+
+        auto tx = GetCurrentTxContext();
+        tx->Begin_standbyredo(snapshotCSN, minSnapshot);
+
+        if (byname) {
+            RowId cusid;
+            /* select from customer by last_name */
+            if (!SelectCustomerByName(tx, c_w_id, d_id, c_last_arg, cusid, cus)) {
+                /* should never happen */
+                tx->Abort();
+                return -1;
+            }
+        } else {
+            /* select from customer by id */
+            SET_INDEX_COL(cusit, pk, c_id, c_id);
+            SET_INDEX_COL(cusit, pk, c_d_id, d_id);
+            SET_INDEX_COL(cusit, pk, c_w_id, c_w_id);
+            SelectTuple(tx, TABLE_CUSTOMER, &cusit, &cus);
+        }
+
+        /* select most recent order of this customer */
+        FETCH_COL(cus, c_id, c_id);
+        if (!SelectMostRecentOrder(tx, c_w_id, c_d_id, c_id, &order)) {
+            /* should never happen */
+            tx->Abort();
+            return -1;
+        }
+
+        /* range select order_line */
+        ORDERLINE_INDEX(keyb);
+        ORDERLINE_INDEX(keye);
+        orderline_to_number_range(keyb, keye, w_id, d_id, GET_COL_INT(order, o_id));
+        int res_size = 0;
+        RowId *row_ids = new RowId[MAX_NUM_ITEMS];
+        RAMTuple **tuples = new RAMTuple *[MAX_NUM_ITEMS];
+        for (int i = 0; i < MAX_NUM_ITEMS; i++) {
+            tuples[i] = HEAP_ORDERLINE();
+        }
+        RangeSearch(tx, idxs[TABLE_OFFSET(TABLE_ORDERLINE)], tables[TABLE_OFFSET(TABLE_ORDERLINE)], &keyb, &keye,
+                    MAX_NUM_ITEMS, &res_size, row_ids, tuples);
+        /* Maybe MAX_NUM_ITEMS + 1 to debug if res_size legal. */
+        DCHECK(res_size > 0 && res_size <= MAX_NUM_ITEMS);
+        for (int i = 0; i < MAX_NUM_ITEMS; i++) {
+            delete tuples[i];
+        }
+        delete[] tuples;
+        delete[] row_ids;
+
+        if (res_size == 0) {
+            tx->Abort();
+            return -1;
+        } else {
+            tx->Commit_standbyredo(commitCSN);
+            return 0;
+        }
+    }
+
+    int redo_delivery(int w_id_arg, int o_carrier_id_arg, uint64 snapshotCSN, 
+                    uint64 minSnapshot, uint64 commitCSN)
+    {
+        int w_id = w_id_arg;
+        int o_carrier_id = o_carrier_id_arg;
+        int c_id;
+        int no_o_id;
+        char datetime[81];
+
+        STACK_NEWORDER(neword);
+        NEWORDER_INDEX(newordit);
+        RowId newordid;
+
+        STACK_ORDER(order);
+        ORDER_INDEX(orderit);
+        RowId orderid;
+
+        STACK_CUSTOMER(cus);
+        CUSTOMER_INDEX(cusit);
+        RowId cusid;
+
+        uint64 ol_delivery_d;
+        float c_balance;
+
+        auto tx = GetCurrentTxContext();
+        tx->Begin_standbyredo(snapshotCSN, minSnapshot);
+
+        for (int d_id = 1; d_id <= DIST_PER_WARE; d_id++) {
+            /* reset it every new order */
+            float ol_total = 0;
+            /* select oldest new order */
+            if (!SelectOldestNewOrder(tx, w_id, d_id, newordid, &neword)) {
+                /* no new order to deliver */
+                continue;
+            }
+            /* delete the oldest new order */
+            if (!DeleteTupleWithIndex(tx, TABLE_NEWORDER, &newordit, &neword, newordid)) {
+                // cout<<"szh 1"<<endl;
+                tx->Abort();
+                return -1;
+            }
+            FETCH_COL(neword, no_o_id, no_o_id);
+            /* update the corresponding order */
+            SET_INDEX_COL(orderit, pk, o_w_id, w_id);
+            SET_INDEX_COL(orderit, pk, o_d_id, d_id);
+            SET_INDEX_COL(orderit, pk, o_id, no_o_id);
+            SelectTuple(tx, TABLE_ORDER, &orderit, &order, &orderid);
+            UPDATE_COL(order, o_carrier_id, o_carrier_id);
+            if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_ORDER)], orderid, &order) != HamStatus::OK) {
+                // cout<<"szh 2"<<endl;
+                tx->Abort();
+                return -1;
+            }
+            /* update order lines */
+            ORDERLINE_INDEX(keyb);
+            ORDERLINE_INDEX(keye);
+            orderline_to_number_range(keyb, keye, w_id, d_id, no_o_id);
+            int res_size = 0;
+            RowId *row_ids = new RowId[MAX_NUM_ITEMS];
+            RAMTuple **tuples = new RAMTuple *[MAX_NUM_ITEMS];
+            for (int i = 0; i < MAX_NUM_ITEMS; i++) {
+                tuples[i] = HEAP_ORDERLINE();
+            }
+            RangeSearch(tx, idxs[TABLE_OFFSET(TABLE_ORDERLINE)], tables[TABLE_OFFSET(TABLE_ORDERLINE)], &keyb, &keye,
+                        MAX_NUM_ITEMS, &res_size, row_ids, tuples);
+            DCHECK(res_size > 0 && res_size <= MAX_NUM_ITEMS && res_size == GET_COL_INT(order, o_ol_cnt));
+            /* Abort if update order line failed. */
+            bool aborted = false;
+            for (int i = 0; i < res_size; i++) {
+                RowId row_id = row_ids[i];
+                RAMTuple *tuple = tuples[i];
+                ol_delivery_d = __rdtsc();
+                RAMTuple &alias_tuple = *tuples[i];
+                UPDATE_COL(alias_tuple, ol_delivery_d, ol_delivery_d);
+                if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_ORDERLINE)], row_id, tuple) != HamStatus::OK) {
+                    // cout<<"szh 3"<<endl;
+                    aborted = true;
+                    break;
+                }
+                /* select sum(ol_amount) order line */
+                ol_total += GET_COL_FLOAT(alias_tuple, ol_amount);
+            }
+            for (int i = 0; i < MAX_NUM_ITEMS; i++) {
+                delete tuples[i];
+            }
+            delete[] tuples;
+            delete[] row_ids;
+
+            if (res_size == 0 || aborted) {
+                // cout<<"szh 4"<<res_size<<" "<<aborted<<endl;
+                tx->Abort();
+                return -1;
+            }
+
+            /* update customer */
+            SET_INDEX_COL(cusit, pk, c_w_id, w_id);
+            SET_INDEX_COL(cusit, pk, c_d_id, d_id);
+            SET_INDEX_COL(cusit, pk, c_id, GET_COL_INT(order, o_c_id));
+            SelectTuple(tx, TABLE_CUSTOMER, &cusit, &cus, &cusid);
+            FETCH_COL(cus, c_balance, c_balance);
+            c_balance += ol_total;
+            UPDATE_COL(cus, c_balance, c_balance);
+            if (HeapUpdate(tx, tables[TABLE_OFFSET(TABLE_CUSTOMER)], cusid, &cus) != HamStatus::OK) {
+                // cout<<"szh 5"<<endl;
+                tx->Abort();
+                return -1;
+            }
+        }
+
+        tx->Commit_standbyredo(commitCSN);
+        return 0;
+    }
+
+    int redo_stocklevel(int w_id_arg, /* warehouse id */
+                   int d_id_arg, /* district id */
+                   int level_arg, /* stock level */
+                     uint64 snapshotCSN,
+                        uint64 minSnapshot,
+                        uint64 commitCSN
+    ) {
+        int w_id = w_id_arg;
+        int d_id = d_id_arg;
+        int level = level_arg;
+        int d_next_o_id;
+        int32_t distinctc = 0;
+        std::unordered_set<int> distset;
+
+        STACK_DISTRICT(dis);
+        DISTRICT_INDEX(disit);
+
+        STACK_STOCK(stock);
+        STOCK_INDEX(stockit);
+
+        auto tx = GetCurrentTxContext();
+        tx->Begin_standbyredo(snapshotCSN, minSnapshot);
+
+        /* select district */
+        SET_INDEX_COL(disit, pk, d_id, d_id);
+        SET_INDEX_COL(disit, pk, d_w_id, w_id);
+        SelectTuple(tx, TABLE_DISTRICT, &disit, &dis);
+        FETCH_COL(dis, d_next_o_id, d_next_o_id);
+
+        /* select orderline join stock */
+        const int maxres = 20 * MAX_NUM_ITEMS;
+        ORDERLINE_INDEX(keyb);
+        ORDERLINE_INDEX(keye);
+        /* [d_next_o_id - 20, d_next_o_id - 1] */
+        orderline_to_number_range(keyb, keye, w_id, d_id, d_next_o_id - 20, d_next_o_id - 1);
+        int res_size = 0;
+        RowId *row_ids = new RowId[maxres];
+        thread_local static RAMTuple **tuples = nullptr;
+        if (tuples == nullptr) {
+            tuples = InitOrderLineArray(maxres);
+        }
+
+        RangeSearch(tx, idxs[TABLE_OFFSET(TABLE_ORDERLINE)], tables[TABLE_OFFSET(TABLE_ORDERLINE)], &keyb, &keye,
+                    maxres, &res_size, row_ids, tuples);
+        DCHECK(res_size > 0 && res_size <= maxres);
+
+        /* if item under stock level */
+        for (int i = 0; i < res_size; i++) {
+            RAMTuple &tuple = *tuples[i];
+            SET_INDEX_COL(stockit, pk, s_w_id, w_id);
+            SET_INDEX_COL(stockit, pk, s_i_id, GET_COL_INT(tuple, ol_i_id));
+            SelectTuple(tx, TABLE_STOCK, &stockit, &stock);
+            DCHECK(GET_COL_INT(stock, s_i_id) == GET_COL_INT(tuple, ol_i_id));
+            if (GET_COL_INT(stock, s_quantity) < level) {
+                distset.insert(GET_COL_INT(tuple, ol_i_id));
+            }
+        }
+
+        delete[] row_ids;
+
+        distinctc = distset.size();
+
+        tx->Commit_standbyredo(commitCSN);
+        return 0;
+    }
+
+    void Redo_all_redolog(uint32_t thread_id)
+    {
+        InitThreadLocalVariables();
+        /* fast_rand() needs per thread initialization */
+        fast_rand_srand(__rdtsc() & UINT32_MAX);
+        while (standbyredo_on_working) {
+            if (!sorted_message_queue[thread_id].empty()) {
+                All_tx_redolog all_tx_redolog;
+                sorted_message_queue[thread_id].pop(all_tx_redolog);
+                redo_all_num_1++;
+                // cout<<"redo_all_num_1: "<<redo_all_num_1<<endl;
+                // string output;
+                // sorted_message_queue.pop(output);
+                // All_tx_redolog all_tx_redolog;
+                // all_tx_redolog.ParseFromString(output);
+                switch (all_tx_redolog.tx_type_m()) {
+                    // neworder
+                    case 1: {
+                        redo_neworder_num_1++;
+                        // cout<<"redo_neworder_num_1: "<<redo_neworder_num_1<<endl;
+                        int w_id = all_tx_redolog.int_arg_1();
+                        int d_id = all_tx_redolog.int_arg_2();
+                        int c_id = all_tx_redolog.int_arg_3();
+                        int ol_cnt = all_tx_redolog.int_arg_4();
+                        int all_local = all_tx_redolog.int_arg_5();
+                        int itemid[MAX_NUM_ITEMS];
+                        int supware[MAX_NUM_ITEMS];
+                        int qty[MAX_NUM_ITEMS];
+                        for (int i = 0; i < ol_cnt; i++) {
+                            itemid[i] = all_tx_redolog.rep_int_arg_1(i);
+                            supware[i] = all_tx_redolog.rep_int_arg_2(i);
+                            qty[i] = all_tx_redolog.rep_int_arg_3(i);
+                        }
+                        uint64 snapshotCSN = all_tx_redolog.m_snapshotcsn_m();
+                        uint64 minSnapshot = all_tx_redolog.m_minsnapshot_m();
+                        uint64 commitCSN = all_tx_redolog.m_commitcsn_m();
+                        // cout<<commitCSN<<" "<<minSnapshot<<" "<<snapshotCSN<<endl;
+                        int ret = redo_neword(w_id, d_id, c_id, ol_cnt, all_local, itemid, supware, qty,
+                                        snapshotCSN, minSnapshot, commitCSN);
+                        if (ret != 0) {
+                            // cout << "redo neworder failed !!!!!!!!!!!" << endl;
+                        }
+                        redo_neworder_num_2++;
+                        // if(ret == 0){
+                        //     cout<<"redo_neworder_num_2: "<<redo_neworder_num_2<<endl;
+                        // }
+                    } break;
+                    // payment
+                    case 2: {
+                        redo_payment_num_1++;
+                        // cout<<"redo_payment_num_1: "<<redo_payment_num_1<<endl;
+                        int w_id = all_tx_redolog.int_arg_1();
+                        int d_id = all_tx_redolog.int_arg_2();
+                        bool byname = all_tx_redolog.bool_arg_1();
+                        int c_w_id = all_tx_redolog.int_arg_3();
+                        int c_d_id = all_tx_redolog.int_arg_4();
+                        int c_id = all_tx_redolog.int_arg_5();
+                        char c_last[17];
+                        memset(c_last, 0, sizeof(c_last));
+                        strncpy(c_last, all_tx_redolog.string_arg_1().c_str(), 16);
+                        float h_amount = all_tx_redolog.float_arg_1();
+                        uint64 snapshotCSN = all_tx_redolog.m_snapshotcsn_m();
+                        uint64 minSnapshot = all_tx_redolog.m_minsnapshot_m();
+                        uint64 commitCSN = all_tx_redolog.m_commitcsn_m();
+                        // cout<<commitCSN<<" "<<minSnapshot<<" "<<snapshotCSN<<endl;
+                        int ret = redo_payment(w_id, d_id, byname, c_w_id, c_d_id, c_id, c_last, h_amount,
+                                                  snapshotCSN, minSnapshot, commitCSN);
+                        if (ret != 0) {
+                            // cout << "redo payment failed !!!!!!!!!!!" << endl;
+                        }
+                        redo_payment_num_2++;
+                        // if(ret == 0){
+                        //     cout<<"redo_payment_num_2: "<<redo_payment_num_2<<endl;
+                        // }
+                    } break;
+                    // ordstat
+                    case 3: {
+                        redo_ordstat_num_1++;
+                        // cout<<"redo_ordstat_num_1: "<<redo_ordstat_num_1<<endl;
+                        int w_id = all_tx_redolog.int_arg_1();
+                        int d_id = all_tx_redolog.int_arg_2();
+                        bool byname = all_tx_redolog.bool_arg_1();
+                        int c_id = all_tx_redolog.int_arg_3();
+                        char c_last[17];
+                        memset(c_last, 0, sizeof(c_last));
+                        strncpy(c_last, all_tx_redolog.string_arg_1().c_str(), 16);
+                        uint64 snapshotCSN = all_tx_redolog.m_snapshotcsn_m();
+                        uint64 minSnapshot = all_tx_redolog.m_minsnapshot_m();
+                        uint64 commitCSN = all_tx_redolog.m_commitcsn_m();
+                        // cout<<commitCSN<<" "<<minSnapshot<<" "<<snapshotCSN<<endl;
+                        int ret = redo_ordstat(w_id, d_id, byname, c_id, c_last,
+                         snapshotCSN, minSnapshot, commitCSN);
+                        if (ret != 0) {
+                            // cout << "redo ordstat failed !!!!!!!!!!!" << endl;
+                        }
+                        redo_ordstat_num_2++;
+                        // if(ret == 0){
+                        //     cout<<"redo_ordstat_num_2: "<<redo_ordstat_num_2<<endl;
+                        // }
+                    } break;
+                    // delivery
+                    case 4: {
+                        redo_delivery_num_1++;
+                        // cout<<"redo_delivery_num_1: "<<redo_delivery_num_1<<endl;
+                        int w_id = all_tx_redolog.int_arg_1();
+                        int o_carrier_id = all_tx_redolog.int_arg_2();
+                        uint64 snapshotCSN = all_tx_redolog.m_snapshotcsn_m();
+                        uint64 minSnapshot = all_tx_redolog.m_minsnapshot_m();
+                        uint64 commitCSN = all_tx_redolog.m_commitcsn_m();
+                        // cout<<commitCSN<<" "<<minSnapshot<<" "<<snapshotCSN<<endl;
+                        int ret = redo_delivery(w_id, o_carrier_id, snapshotCSN, minSnapshot, commitCSN);
+                        if (ret != 0) {
+                            // cout << "redo delivery failed !!!!!!!!!!!" << endl;
+                        }
+                        redo_delivery_num_2++;
+                        // if(ret == 0){
+                        //     cout<<"redo_delivery_num_2: "<<redo_delivery_num_2<<endl;
+                        // }
+                    } break;
+                    //stocklevel
+                    case 5: {
+                        redo_stocklevel_num_1++;
+                        // cout<<"redo_stocklevel_num_1: "<<redo_stocklevel_num_1<<endl;
+                        int w_id = all_tx_redolog.int_arg_1();
+                        int d_id = all_tx_redolog.int_arg_2();
+                        int level = all_tx_redolog.int_arg_3();
+                        uint64 snapshotCSN = all_tx_redolog.m_snapshotcsn_m();
+                        uint64 minSnapshot = all_tx_redolog.m_minsnapshot_m();
+                        uint64 commitCSN = all_tx_redolog.m_commitcsn_m();
+                        // cout<<commitCSN<<" "<<minSnapshot<<" "<<snapshotCSN<<endl;
+                        int ret = redo_stocklevel(w_id, d_id, level, snapshotCSN, minSnapshot, commitCSN);
+                        if (ret != 0) {
+                            // cout << "redo stocklevel failed !!!!!!!!!!!" << endl;
+                        }
+                        redo_stocklevel_num_2++;
+                        // if(ret == 0){
+                        //     cout<<"redo_stocklevel_num_2: "<<redo_stocklevel_num_2<<endl;
+                        // }
+                    } break;
+
+                    default:
+                        break;
+                }
+                redo_all_num_2++;
+            }
+        }
+        cout<<"redo_all_redolog end"<<endl;
+    }
+
+    // void Redo_thread()
+    // {
+    //     // int i = 0;
+    //     while (true) {
+    //         if (!message_queue.empty()) {
+    //             string output;
+    //             message_queue.pop(output);
+    //             Person pp;
+    //             pp.ParseFromString(output);
+    //             cout << pp.id() << " " << pp.age() << " " << pp.sex() << " " << pp.name() << endl;
+    //         }
+    //     }
+    //     // cout << i << endl;
+    // }
+
+    // 排序处理线程函数
+    void TOsort_message_queue()
+    {
+        sleep(5);
+        cout<<"开始排序事务"<<endl;
+        while (sort_on_working) {
+            // sleep(2);
+            vector<string> batch;
+            int batch_size = 30000;
+            message_queue.pop_all(batch, batch_size);
+            vector<All_tx_redolog> tmp;
+            for (const auto &item : batch) {
+                All_tx_redolog all_tx_redolog;
+                all_tx_redolog.ParseFromString(item);
+                if (all_tx_redolog.tx_type_m() == 100) {
+                    turn_to_master = true;
+                    sleep(3);
+                    return;
+                }
+                tmp.push_back(all_tx_redolog);
+            }
+            // 对提取的批量数据排序
+            std::sort(tmp.begin(), tmp.end(), [](const All_tx_redolog &a, const All_tx_redolog &b) {
+                return a.m_commitcsn_m() < b.m_commitcsn_m();  // 按 m_commitcsn_m 从小到大排序
+            });
+            // 将排序后的数据推入目标队列
+            for (const auto &item : tmp) {
+                sorted_message_queue[(item.int_arg_1()-1)/(warmup/workers)].push(item);
+            }
+            // for (const auto &item : tmp) {
+            //     string output;
+            //     item.SerializeToString(&output);
+            //     sorted_message_queue.push(output);
+            // }
+        }
+    }
+
+    void Recv_thread()
+    {
+        void *context = zmq_ctx_new();
+        assert(context != NULL);
+        void *socket = zmq_socket(context, ZMQ_PULL);
+        assert(socket != NULL);
+        int ret = zmq_connect(socket, "tcp://172.29.201.170:5555");
+        assert(ret == 0);
+        // this_thread::sleep_for(chrono::seconds(4));
+        cout << "standby_szh_helmdb start recv" << endl;
+        while (recv_on_working) {
+            // cout<<"recving message is recving"<<endl;
+            char message[1024] = {0};
+            // cout<<"recv_message_before:"<<recv_message_before++<<endl;
+            int ret = zmq_recv(socket, message, sizeof(message), ZMQ_DONTWAIT);
+            // cout<<"recving message recv success "<<endl;
+            if (ret > 0) {
+                string output(message);
+                message_queue.push(output);
+                // cout<<"recv_message_after:"<<recv_message_after++<<endl;
+                recv_message_after++;
+            }
+        }
+        // cout<<"recv_thread end"<<endl;
+        zmq_close(socket);
+        // cout<<"recv_thread end"<<endl;
+        zmq_ctx_destroy(context);
+        // cout<<"recv_thread end"<<endl;
+    }
+
+    void turn_to_master_run()
+    {
+        while (need_always_toif) {
+            if (turn_to_master) {
+                        // 获取高分辨率时钟的当前时间点
+                        auto now = std::chrono::high_resolution_clock::now();
+
+                        // 转换为 time_point<std::chrono::system_clock>
+                        std::time_t now_time_t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::from_time_t(
+                            std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count()));
+
+                        // 转换为 tm 结构（本地时间）
+                        std::tm *local_tm = std::localtime(&now_time_t);
+
+                        // 打印日期和时间部分
+                        std::cout << "当前时间: " << std::put_time(local_tm, "%Y-%m-%d %H:%M:%S") << ".";
+
+                        // 获取自纪元以来的时间差（以纳秒为单位）
+                        auto duration = now.time_since_epoch();
+                        auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() % 1000000000;
+
+                        // 打印纳秒部分
+                        std::cout << std::setw(9) << std::setfill('0') << nanoseconds << " ns" << std::endl;
+                if (type == 1 || type == 3) {
+                    std::thread worker_tids[workers];
+                    on_working = true;
+                    for (uint32_t i = 0; i < workers; i++) {
+                        worker_tids[i] = std::thread(&TPCCBench::tpcc_q, this, i);
+                    }
+                    sleep(run_time);
+                    on_working = false;
+                    for (int i = 0; i < workers; i++)
+                        worker_tids[i].join();
+
+                    printTpccStat();
+                }
+            }
+        }
+    }
+
+    void RunBench()
+    {
+        if (type == 1 || type == 3) {
+            // thread worker_tids[workers];
+            // thread redo_worker = thread(&TPCCBench::Redo_thread, this);
+            // thread redo_all_redolog_worker = thread(&TPCCBench::Redo_all_redolog, this);
+            need_always_toif = true;
+            turn_to_master = false;
+            thread turn_to_master_run_thread = thread(&TPCCBench::turn_to_master_run, this);
+            standbyredo_on_working = true;
+            recv_on_working = true;
+            sort_on_working = true;
+            thread recv_worker = thread(&TPCCBench::Recv_thread, this);
+            thread sort_worker = thread(&TPCCBench::TOsort_message_queue, this);
+            thread redo_all_redolog_worker[workers];
+            for (uint32_t i = 0; i < workers; i++) {
+                redo_all_redolog_worker[i] = thread(&TPCCBench::Redo_all_redolog, this, i);
+            }
+
+            // for (uint32_t i = 0; i < workers; i++) {
+            //     redo_all_redolog_worker[i] = thread(&TPCCBench::Redo_all_redolog, this,i);
+            // }
+            sleep(run_time);
+            sleep(20);  //比send延后20-10-3=7s
+            recv_on_working = false;
+            sleep(5);   //用5s把message_queue中剩下的数据排序好
+            // sort_on_working = false;
+            sleep(5);  //redo线程要多执行20+5+?的时间
+            standbyredo_on_working = false;
+            for (int i = 0; i < workers; i++)
+                redo_all_redolog_worker[i].join();
+            // redo_all_redolog_worker.join();
+            sort_on_working = false;
+            sort_worker.join();
+            int tmp_all_1 = redo_neworder_num_1 + redo_payment_num_1 + redo_ordstat_num_1 + redo_delivery_num_1 + redo_stocklevel_num_1;
+            int tmp_all_2 = redo_neworder_num_2 + redo_payment_num_2 + redo_ordstat_num_2 + redo_delivery_num_2 + redo_stocklevel_num_2;
+            cout<<endl;
+            cout << recv_message_after <<" : "<<redo_all_num_1 <<" "<<redo_all_num_2<<" : "
+            <<redo_neworder_num_1 <<" "<<redo_neworder_num_2<<" "<<redo_payment_num_1<<" "<<redo_payment_num_2<<" "
+            <<redo_ordstat_num_1<<" "<<redo_ordstat_num_2<<" "<<redo_delivery_num_1<<" "<<redo_delivery_num_2<<" "
+            <<redo_stocklevel_num_1<<" "<<redo_stocklevel_num_2<<endl;
+            cout<<tmp_all_1<<" "<<tmp_all_2<<endl;
+            cout<<endl;
+            recv_worker.join();
+            // redo_worker.join();
+            // printTpccStat();
+            turn_to_master_run_thread.join();
+        }
+        // check_consistency();
+    }
+    };
 
 class TPCCTest : public ::testing::Test {
 protected:
@@ -1920,10 +2834,13 @@ protected:
 };
 
 TEST_F(TPCCTest, TPCCTestMain) {
+    int major,minor,patch;
+    zmq_version(&major,&minor,&patch);    //返回ZMQ链接库的版本
+    printf("Current ZMQ version is %d.%d.%d\n",major,minor,patch); //输出版本号    
     // 要使用TPCC测试需要将 nvm_index_tuple中的 For tpcc testing 启用
-    IndexBenchOpts opt = {.threads = 100, .duration = 60, .warmup = 100, .type = 3, .bind = false};
+    IndexBenchOpts opt = {.threads = 4, .duration = 30, .warmup = 12, .type = 3, .bind = false};
 
-    TPCCBench bench("/mnt/pmem0/bench;/mnt/pmem1/bench", opt.threads, opt.duration, opt.warmup, opt.bind, opt.type);
+    TPCCBench bench("/mnt/pmem2/test_tpcc_standby", opt.threads, opt.duration, opt.warmup, opt.bind, opt.type);
     bench.InitBench();
     bench.WarmUp();
     bench.RunBench();

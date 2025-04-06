@@ -105,6 +105,13 @@ HamStatus HeapUpdate(Transaction *tx, Table *table, RowId rowId, RAMTuple *tuple
     const auto* dramCache = rowEntry->loadDRAMCache<NVMTuple>(RealTupleSize(tuple->getRowLen()));
     TMResult result = tx->SatisfiedUpdate(*dramCache);
     if (result == TMResult::INVISIBLE || result == TMResult::BEING_MODIFIED) {
+        // if(result == TMResult::INVISIBLE) {
+        //     LOG(ERROR)<<"HeapUpdate 1 TMResult::INVISIBLE";
+        // }
+        // if(result == TMResult::BEING_MODIFIED) {
+        //     LOG(ERROR)<<"HeapUpdate 1 TMResult::BEING_MODIFIED";
+        // }
+        // LOG(ERROR)<<"HeapUpdate 1 "
         rowEntry->Unlock();
         tx->WaitAbort();
         return HamStatus::UPDATE_CONFLICT;
@@ -112,6 +119,7 @@ HamStatus HeapUpdate(Transaction *tx, Table *table, RowId rowId, RAMTuple *tuple
 
     DCHECK(result == TMResult::OK);
     if (dramCache->m_isDeleted) {
+        LOG(ERROR)<<"HeapUpdate 2";
         rowEntry->Unlock();
         /* 一个”可见“的删除操作，说明尝试更新一个被删除的 tuple，需要报 error */
         tx->WaitAbort();

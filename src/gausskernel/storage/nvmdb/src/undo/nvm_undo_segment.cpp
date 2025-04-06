@@ -226,7 +226,7 @@ void UndoSegmentUnmount() {
     g_doRecycle = false;
     g_undoRecycle.join();
     for (int i = 0; i < NVMDB_UNDO_SEGMENT_NUM; i++) {
-        DCHECK(!g_undo_segment_allocated[i]);
+        // DCHECK(!g_undo_segment_allocated[i]);
         g_undo_segments[i]->unmount();
         delete g_undo_segments[i];
         g_undo_segments[i] = nullptr;

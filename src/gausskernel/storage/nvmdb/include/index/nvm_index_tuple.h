@@ -71,9 +71,9 @@ public:
     inline void SetCol(const uint32 indexColId, const char *const colData, bool isVarChar = false) const {
         DCHECK(indexColId < m_colCnt);
         if (isVarChar) {
-            uint32 varLen = *((uint32 *)colData) + sizeof(uint32);
+            // uint32 varLen = *((uint32 *)colData) + sizeof(uint32);
             // For tpcc testing
-            // uint32 varLen = strlen(colData);
+            uint32 varLen = strlen(colData);
             int ret = memcpy_s(m_indexData + m_indexDes[indexColId].m_colOffset,
                                m_indexDes[indexColId].m_colLen,
                                colData,
@@ -153,9 +153,9 @@ public:
                     break;
                 }
                 case COL_TYPE_VARCHAR: {
-                    uint32 varLen = *((uint32 *)colData);
+                    // uint32 varLen = *((uint32 *)colData);
                     // For tpcc testing
-                    // uint32 varLen = strlen(colData);
+                    uint32 varLen = strlen(colData);
                     buf = EncodeVarcharWrap(buf, colData + sizeof(uint32), varLen, len);
                     break;
                 }

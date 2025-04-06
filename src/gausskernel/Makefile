@@ -183,7 +183,7 @@ endif
 # NVMDB component
 ##############################################################################
 ifeq ($(enable_nvmdb), yes)
-  LIBS += -lstdc++fs -ltbb -lndctl -ldaxctl -lpmemobj -lpmem -lglog -lgflags -lnuma
+  LIBS += -lstdc++fs -ltbb -lndctl -ldaxctl -lpmemobj -lpmem -lglog -lgflags -lnuma -lzmq -lprotobuf
   LDFLAGS += -L$(TBB_LIB_PATH) -L$(PMDK_LIB_PATH) -L$(GFLAG_LIB_PATH) -L$(GLOG_LIB_PATH)
   CXXFLAGS += -I$(TBB_INCLUDE_PATH) -I$(PMDK_INCLUDE_PATH)
 endif
