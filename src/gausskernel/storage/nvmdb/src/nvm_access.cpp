@@ -105,6 +105,12 @@ HamStatus HeapUpdate(Transaction *tx, Table *table, RowId rowId, RAMTuple *tuple
     const auto* dramCache = rowEntry->loadDRAMCache<NVMTuple>(RealTupleSize(tuple->getRowLen()));
     TMResult result = tx->SatisfiedUpdate(*dramCache);
     if (result == TMResult::INVISIBLE || result == TMResult::BEING_MODIFIED) {
+        // if (result == TMResult::INVISIBLE) {
+        //     LOG(ERROR) << "HeapUpdate 1 TMResult::INVISIBLE";
+        // }
+        // if (result == TMResult::BEING_MODIFIED) {
+        //     LOG(ERROR) << "HeapUpdate 1 TMResult::BEING_MODIFIED";
+        // }
         rowEntry->Unlock();
         tx->WaitAbort();
         return HamStatus::UPDATE_CONFLICT;

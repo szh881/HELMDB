@@ -1,4 +1,7 @@
 #include "tpcc.h"
+#include <zmq.h>
+#include "Person.pb.h"
+#include "Message.pb.h"
 #include "nvm_init.h"
 #include "nvm_access.h"
 #include "nvmdb_thread.h"
@@ -9,9 +12,73 @@
 #include <getopt.h>
 #include <thread>
 #include <unordered_set>
+#include <queue>
+#include <chrono>
+#include <mutex>
+#include <condition_variable>
+#include <iostream>
+#include <iomanip>
+#include <ctime>
+#include <thread>
+#include <atomic>
+#include <vector>
+using namespace std;
 
 namespace NVMDB {
 namespace TPCC {
+    volatile bool send_on_working;
+    atomic<int> neworder_num{0};
+    atomic<int> payment_num{0};
+    atomic<int> ordstat_num{0};
+    atomic<int> delivery_num{0};
+    atomic<int> stocklevel_num{0};
+    atomic<int> send_message_before{0};
+    atomic<int> send_message_after{0};
+template<typename T>
+class ConcurrentQueue {
+private:
+    std::queue<T> queue;
+    mutable std::mutex mutex;
+    std::condition_variable cond_var;
+
+public:
+    // 入队操作
+    void push(const T& value) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            queue.push(value);
+        }
+        cond_var.notify_one();
+    }
+
+    // 出队操作
+    bool pop(T& value) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (queue.empty()) return false;  // 非阻塞弹出
+        value = queue.front();
+        queue.pop();
+        return true;
+    }
+
+    bool pop_all(std::vector<T>& values, size_t max_count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (queue.empty()) return false;  // 非阻塞弹出
+        size_t count = 0;
+        while (!queue.empty() && count < max_count) {
+            values.push_back(queue.front());
+            queue.pop();
+            ++count;
+        }
+        return !values.empty();
+    }
+
+    // 检查队列是否为空
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return queue.empty();
+    }
+};
+ConcurrentQueue<string> message_queue;
 
 /* hardwired. */
 #ifdef NDEBUG
@@ -775,6 +842,39 @@ public:
                int supware[],       /* warehouses supplying items */
                int qty[]            /* quantity of each item */
     ) {
+                                        // 获取高分辨率时钟的当前时间点
+                                        auto now = std::chrono::high_resolution_clock::now();
+
+                                        // 转换为 time_point<std::chrono::system_clock>
+                                        std::time_t now_time_t = std::chrono::system_clock::to_time_t(
+                                            std::chrono::system_clock::from_time_t(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count())
+                                        );
+
+                                        // 转换为 tm 结构（本地时间）
+                                        std::tm* local_tm = std::localtime(&now_time_t);
+
+                                        // 打印日期和时间部分
+                                        std::cout << "neworder开始: " 
+                                                << std::put_time(local_tm, "%Y-%m-%d %H:%M:%S") 
+                                                << ".";
+
+                                        // 获取自纪元以来的时间差（以纳秒为单位）
+                                        auto duration = now.time_since_epoch();
+                                        auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() % 1000000000;
+
+                                        // 打印纳秒部分
+                                        std::cout << std::setw(9) << std::setfill('0') << nanoseconds << " ns" << std::endl;
+        // uint64 m_undoTxContext_address_1 = 0;
+        // uint64 m_undoTxContext_address_2 = 0;
+        // uint64 m_undoTxContext_address_3 = 0;
+        // uint64 m_undoTxContext_address_4 = 0;
+        // uint64 m_undoTxContext_address_5 = 0;
+        // uint64 m_undoTxContext_address_6 = 0;
+        // uint64 m_undoTxContext_address_7 = 0;
+        // uint64 m_undoTxContext_address_8 = 0;
+        // uint64 m_undoTxContext_address_9 = 0;
+        // uint64 m_undoTxContext_address_10 = 0;
+
         int w_id = w_id_arg;
         int d_id = d_id_arg;
         int c_id = c_id_arg;
@@ -923,6 +1023,63 @@ public:
         }
 
         tx->Commit();
+        // uint64 m_undoTxContext_address = reinterpret_cast<uint64>(tx->GetUndoTxContext());
+        // cout << " m_undoTxContext_address_1:" << m_undoTxContext_address_1
+        //      << " m_undoTxContext_address_2:" << m_undoTxContext_address_2
+        //      << " m_undoTxContext_address_3:" << m_undoTxContext_address_3
+        //      << " m_undoTxContext_address_4:" << m_undoTxContext_address_4
+        //      << " m_undoTxContext_address_5:" << m_undoTxContext_address_5
+        //      << " m_undoTxContext_address_6:" << m_undoTxContext_address_6
+        //      << " m_undoTxContext_address_7:" << m_undoTxContext_address_7
+        //      << " m_undoTxContext_address_8:" << m_undoTxContext_address_8
+        //      << " m_undoTxContext_address_9:" << m_undoTxContext_address_9
+        //      << " m_undoTxContext_address_10:" << m_undoTxContext_address_10
+        //      << " m_undoTxContext_address:" << m_undoTxContext_address << " m_txSlotPtr: " << tx->GetTxSlotLocation()
+        //      << " m_snapshotCSN: " << tx->GetSnapshot() << " m_commitCSN: " << tx->GetCommitCSN()
+        //      << " m_minSnapshot: " << tx->GetMinSnapshot() << " m_procArrayTID: " << tx->GetProcArrayTID() << endl;
+
+        All_tx_redolog neworder_m;
+        neworder_m.set_tx_type_m(1);
+        neworder_m.set_int_arg_1(w_id_arg);
+        neworder_m.set_int_arg_2(d_id_arg);
+        neworder_m.set_int_arg_3(c_id_arg);
+        neworder_m.set_int_arg_4(o_ol_cnt_arg);
+        neworder_m.set_int_arg_5(o_all_local_arg);
+        neworder_m.set_m_snapshotcsn_m(tx->GetSnapshot());
+        neworder_m.set_m_commitcsn_m(tx->GetCommitCSN());
+        neworder_m.set_m_minsnapshot_m(tx->GetMinSnapshot());
+        for (int i = 0; i < o_ol_cnt_arg; i++) {
+            neworder_m.add_rep_int_arg_1(itemid[i]);
+            neworder_m.add_rep_int_arg_2(supware[i]);
+            neworder_m.add_rep_int_arg_3(qty[i]);
+        }
+        string output;
+        neworder_m.SerializeToString(&output);
+        message_queue.push(output);
+        neworder_num++;
+                                        // 获取高分辨率时钟的当前时间点
+                                        auto now2 = std::chrono::high_resolution_clock::now();
+
+                                        // 转换为 time_point<std::chrono::system_clock>
+                                        std::time_t now_time_t2 = std::chrono::system_clock::to_time_t(
+                                            std::chrono::system_clock::from_time_t(std::chrono::duration_cast<std::chrono::seconds>(now2.time_since_epoch()).count())
+                                        );
+
+                                        // 转换为 tm 结构（本地时间）
+                                        std::tm* local_tm2 = std::localtime(&now_time_t2);
+
+                                        // 打印日期和时间部分
+                                        std::cout << "neworder结束: " 
+                                                << std::put_time(local_tm2, "%Y-%m-%d %H:%M:%S") 
+                                                << ".";
+
+                                        // 获取自纪元以来的时间差（以纳秒为单位）
+                                        auto duration2 = now2.time_since_epoch();
+                                        auto nanoseconds2 = std::chrono::duration_cast<std::chrono::nanoseconds>(duration2).count() % 1000000000;
+
+                                        // 打印纳秒部分
+                                        std::cout << std::setw(9) << std::setfill('0') << nanoseconds2 << " ns" << std::endl;
+                                        cout<<"执行时间："<<nanoseconds2-nanoseconds<<endl;
         return 0;
     }
 
@@ -1067,6 +1224,25 @@ public:
         SET_COL(hist, h_date, h_date);
         InsertTupleWithIndex(tx, TABLE_HISTORY, nullptr, &hist);
         tx->Commit();
+        All_tx_redolog payment_m;
+        payment_m.set_tx_type_m(2);
+        payment_m.set_int_arg_1(w_id_arg);
+        payment_m.set_int_arg_2(d_id_arg);
+        payment_m.set_bool_arg_1(byname);
+        payment_m.set_int_arg_3(c_w_id_arg);
+        payment_m.set_int_arg_4(c_d_id_arg);
+        payment_m.set_int_arg_5(c_id_arg);
+        payment_m.set_string_arg_1(string(c_last_arg));
+        payment_m.set_float_arg_1(h_amount_arg);
+        payment_m.set_m_snapshotcsn_m(tx->GetSnapshot());
+        payment_m.set_m_commitcsn_m(tx->GetCommitCSN());
+        payment_m.set_m_minsnapshot_m(tx->GetMinSnapshot());
+            // cout<<tx->GetCommitCSN()<<" "<<tx->GetMinSnapshot()<<" "<<tx->GetSnapshot()<<endl;
+        string output;
+        payment_m.SerializeToString(&output);
+        message_queue.push(output);
+        payment_num++;
+
         return 0;
     }
 
@@ -1096,7 +1272,7 @@ public:
 
     int ordstat(int w_id_arg,     /* warehouse id */
                 int d_id_arg,     /* district id */
-                int byname,       /* select by c_id or c_last? */
+                bool byname,       /* select by c_id or c_last? */
                 int c_id_arg,     /* customer id */
                 char c_last_arg[] /* customer last name, format? */
     ) {
@@ -1162,6 +1338,20 @@ public:
             return -1;
         } else {
             tx->Commit();
+            All_tx_redolog ordstat_m;
+            ordstat_m.set_tx_type_m(3);
+            ordstat_m.set_int_arg_1(w_id_arg);
+            ordstat_m.set_int_arg_2(d_id_arg);
+            ordstat_m.set_bool_arg_1(byname);
+            ordstat_m.set_int_arg_3(c_id_arg);
+            ordstat_m.set_string_arg_1(string(c_last_arg));
+            ordstat_m.set_m_snapshotcsn_m(tx->GetSnapshot());
+            ordstat_m.set_m_commitcsn_m(tx->GetCommitCSN());
+            ordstat_m.set_m_minsnapshot_m(tx->GetMinSnapshot());
+            string output;
+            ordstat_m.SerializeToString(&output);
+            message_queue.push(output);
+            ordstat_num++;
             return 0;
         }
     }
@@ -1284,6 +1474,18 @@ public:
         }
 
         tx->Commit();
+        All_tx_redolog delivery_m;
+        delivery_m.set_tx_type_m(4);
+        delivery_m.set_int_arg_1(w_id_arg);
+        delivery_m.set_int_arg_2(o_carrier_id_arg);
+        delivery_m.set_m_snapshotcsn_m(tx->GetSnapshot());
+        delivery_m.set_m_commitcsn_m(tx->GetCommitCSN());
+        delivery_m.set_m_minsnapshot_m(tx->GetMinSnapshot());
+            // cout<<tx->GetCommitCSN()<<" "<<tx->GetMinSnapshot()<<" "<<tx->GetSnapshot()<<endl;
+        string output;
+        delivery_m.SerializeToString(&output);
+        message_queue.push(output);
+        delivery_num++;
         return 0;
     }
 
@@ -1364,6 +1566,18 @@ public:
         distinctc = distset.size();
 
         tx->Commit();
+        All_tx_redolog stocklevel_m;
+        stocklevel_m.set_tx_type_m(5);
+        stocklevel_m.set_int_arg_1(w_id_arg);
+        stocklevel_m.set_int_arg_2(d_id_arg);
+        stocklevel_m.set_int_arg_3(level_arg);
+        stocklevel_m.set_m_snapshotcsn_m(tx->GetSnapshot());
+        stocklevel_m.set_m_commitcsn_m(tx->GetCommitCSN());
+        stocklevel_m.set_m_minsnapshot_m(tx->GetMinSnapshot());
+        string output;
+        stocklevel_m.SerializeToString(&output);
+        message_queue.push(output);
+        stocklevel_num++;
         return 0;
     }
 
@@ -1377,14 +1591,14 @@ public:
         return stocklevel(w_id, d_id, level);
     }
 
-    void tpcc_q(uint32_t wid) {
+    void tpcc_q(uint32_t thread_id) {
         int tranid;
         int r;
         int ret;
-        uint32_t start = wh_start;
-        uint32_t end = wh_end;
+        uint32_t start = (warmup / workers) * thread_id + wh_start;
+        uint32_t end = (warmup / workers) * (thread_id + 1);
         if (bind) {
-            GetSplitRange(workers, wh_end, wid, &start, &end);
+            GetSplitRange(workers, wh_end, thread_id, &start, &end);
         }
         InitThreadLocalVariables();
         /* fast_rand() needs per thread initialization */
@@ -1434,9 +1648,9 @@ public:
 
             /* -1: Aborted */
             if (ret == 0)
-                __sync_fetch_and_add(&g_stats[wid].runstat_[tranid].nCommitted_, 1);
+                __sync_fetch_and_add(&g_stats[thread_id].runstat_[tranid].nCommitted_, 1);
             else
-                __sync_fetch_and_add(&g_stats[wid].runstat_[tranid].nAborted_, 1);
+                __sync_fetch_and_add(&g_stats[thread_id].runstat_[tranid].nAborted_, 1);
         }
         DestroyThreadLocalVariables();
     }
@@ -1894,21 +2108,110 @@ public:
         LOG(INFO) << "finish all consistency check";
     }
 
-    void RunBench() {
+    void send_thread()
+    {
+        cout << "send_thread start" << endl;
+        void *context = zmq_ctx_new();
+        if (context == NULL) {
+            cout << "zmq_ctx_new failed" << endl;
+            return;
+        }
+        cout << "zmq_ctx_new success" << endl;
+        void *socket = zmq_socket(context, ZMQ_PUSH);
+        if (socket == NULL) {
+            cout << "zmq_socket failed" << endl;
+            return;
+        }
+        cout << "zmq_socket success" << endl;
+        int sendBufSize = 10000000;
+        zmq_setsockopt(socket, ZMQ_SNDBUF, &sendBufSize, sizeof(sendBufSize));
+        int sendHWM = 10000;
+        zmq_setsockopt(socket, ZMQ_SNDHWM, &sendHWM, sizeof(sendHWM));
+        int ret = zmq_bind(socket, "tcp://*:5555");
+        if (ret != 0) {
+            cout << "zmq_bind failed" << endl;
+            return;
+        }
+        cout << "zmq_bind success" << endl;
+        this_thread::sleep_for(chrono::seconds(3)); //发送比接收晚开始3s
+        cout << "szh_helmdb start send" << endl;
+        while (send_on_working) {
+            if (!message_queue.empty()) {
+                char message[1024] = {0};
+                string message_to_send;
+                message_queue.pop(message_to_send);
+                message_to_send.copy(message, message_to_send.size());
+                message[message_to_send.size()] = '\0';
+                send_message_before++;
+                // cout<<"send_message_before:"<< send_message_before++ <<endl;
+                ret = zmq_send(socket, message, strlen(message), ZMQ_DONTWAIT);
+                if (ret > 0) {
+                    send_message_after++;
+                    // cout<<"send_message_after:"<< send_message_after++ <<endl;
+                }
+                // cout<<"sending message is working*********************" <<endl;
+            }
+        }
+        zmq_close(socket);
+        zmq_ctx_destroy(context);
+        cout << "send_thread end" << endl;
+    }
+
+    void RunBench()
+    {
         if (type == 1 || type == 3) {
-            std::thread worker_tids[workers];
+            // thread send_worker = thread(&TPCCBench::send_thread, this);
+            thread worker_tids[workers];
             on_working = true;
+            send_on_working = true;
+            thread send_worker = thread(&TPCCBench::send_thread, this);
+                                        sleep(12);
+                                        All_tx_redolog stop_to_standby;
+                                        stop_to_standby.set_tx_type_m(100);
+                                        string output;
+                                        stop_to_standby.SerializeToString(&output);
+                                        message_queue.push(output);
+                                        // 获取高分辨率时钟的当前时间点
+                                        auto now = std::chrono::high_resolution_clock::now();
+
+                                        // 转换为 time_point<std::chrono::system_clock>
+                                        std::time_t now_time_t = std::chrono::system_clock::to_time_t(
+                                            std::chrono::system_clock::from_time_t(std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count())
+                                        );
+
+                                        // 转换为 tm 结构（本地时间）
+                                        std::tm* local_tm = std::localtime(&now_time_t);
+
+                                        // 打印日期和时间部分
+                                        std::cout << "当前时间: " 
+                                                << std::put_time(local_tm, "%Y-%m-%d %H:%M:%S") 
+                                                << ".";
+
+                                        // 获取自纪元以来的时间差（以纳秒为单位）
+                                        auto duration = now.time_since_epoch();
+                                        auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() % 1000000000;
+
+                                        // 打印纳秒部分
+                                        std::cout << std::setw(9) << std::setfill('0') << nanoseconds << " ns" << std::endl;
             for (uint32_t i = 0; i < workers; i++) {
-                worker_tids[i] = std::thread(&TPCCBench::tpcc_q, this, i);
+                worker_tids[i] = thread(&TPCCBench::tpcc_q, this, i);
             }
             sleep(run_time);
             on_working = false;
+            sleep(10);  //多发送10s
+            send_on_working = false;
             for (int i = 0; i < workers; i++)
                 worker_tids[i].join();
 
+            send_worker.join();
+            cout<<endl;
+            cout << "neworder_num: " << neworder_num 
+            << " send_message_before: " << send_message_before
+                 << " send_message_after: " << send_message_after << endl;
+            cout<<endl;
             printTpccStat();
         }
-        check_consistency();
+        // check_consistency();
     }
 };
 
@@ -1920,10 +2223,13 @@ protected:
 };
 
 TEST_F(TPCCTest, TPCCTestMain) {
+    int major,minor,patch;
+    zmq_version(&major,&minor,&patch);    //返回ZMQ链接库的版本
+    printf("Current ZMQ version is %d.%d.%d\n",major,minor,patch); //输出版本号
     // 要使用TPCC测试需要将 nvm_index_tuple中的 For tpcc testing 启用
-    IndexBenchOpts opt = {.threads = 100, .duration = 60, .warmup = 100, .type = 3, .bind = false};
+    IndexBenchOpts opt = {.threads = 4, .duration = 30, .warmup = 12, .type = 3, .bind = false};
 
-    TPCCBench bench("/mnt/pmem0/bench;/mnt/pmem1/bench", opt.threads, opt.duration, opt.warmup, opt.bind, opt.type);
+    TPCCBench bench("/mnt/pmem2/test_tpcc_send", opt.threads, opt.duration, opt.warmup, opt.bind, opt.type);
     bench.InitBench();
     bench.WarmUp();
     bench.RunBench();

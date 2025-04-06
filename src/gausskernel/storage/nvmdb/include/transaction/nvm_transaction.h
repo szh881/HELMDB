@@ -68,14 +68,6 @@ public:
         m_txStatus = TxStatus::WAIT_ABORT;
     }
 
-    [[nodiscard]] TxStatus GetTxStatus() const {
-        return m_txStatus;
-    }
-
-    [[nodiscard]] TxSlotPtr GetTxSlotLocation() const {
-        return m_txSlotPtr;
-    }
-
     UndoRecPtr insertUndoRecord(UndoRecord *record) {
         return m_undoTxContext->insertUndoRecord(record);
     }
@@ -113,8 +105,71 @@ public:
     inline void PushWriteSet(RowIdMapEntry *row) {
         m_writeSet.push_back(row); }
 
-    // For testing only
-    inline uint64 GetSnapshot() const { return m_snapshotCSN; }
+    const UndoTxContext *GetUndoTxContext() const
+    {
+        return m_undoTxContext.get();  // 返回指针但不转移所有权
+    }
+    void SetUndoTxContext(std::unique_ptr<UndoTxContext> undoTxContext)
+    {
+
+        m_undoTxContext = std::move(undoTxContext);
+    }
+    TxSlotPtr GetTxSlotLocation() const
+    {
+        return m_txSlotPtr;
+    }
+    void SetTxSlotLocation(TxSlotPtr txSlotPtr)
+    {
+        m_txSlotPtr = txSlotPtr;
+    }
+    uint64 GetSnapshot() const
+    {
+        return m_snapshotCSN;
+    }
+    void SetSnapshot(uint64 snapshot)
+    {
+        m_snapshotCSN = snapshot;
+    }
+    uint64 GetCommitCSN() const
+    {
+        return m_commitCSN;
+    }
+    void SetCommitCSN(uint64 commitCSN)
+    {
+        m_commitCSN = commitCSN;
+    }
+    uint64 GetMinSnapshot() const
+    {
+        return m_minSnapshot;
+    }
+    void SetMinSnapshot(uint64 minSnapshot)
+    {
+        m_minSnapshot = minSnapshot;
+    }
+    TxStatus GetTxStatus() const
+    {
+        return m_txStatus;
+    }
+    void SetTxStatus(TxStatus txStatus)
+    {
+        m_txStatus = txStatus;
+    }
+    uint32 GetProcArrayTID() const
+    {
+        return m_procArrayTID;
+    }
+    void SetProcArrayTID(uint32 procArrayTID)
+    {
+        m_procArrayTID = procArrayTID;
+    }
+    ProcessArray* GetProcessArray() const
+    {
+        return m_processArray;
+    }
+    void SetProcessArray(ProcessArray* processArray)
+    {
+        m_processArray = processArray;
+    }
 
 protected:
     void PrepareIndexInsertUndo(const Key_t &key);

@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+message All_tx_redolog
+{
+    int32 tx_type_m=1;
+    uint64 m_snapshotcsn_m=2;
+    uint64 m_commitcsn_m=3;
+    uint64 m_minsnapshot_m=4;
+    int32 int_arg_1=5;
+    int32 int_arg_2=6;
+    int32 int_arg_3=7;
+    int32 int_arg_4=8;
+    int32 int_arg_5=9;
+    repeated int32 rep_int_arg_1=10;
+    repeated int32 rep_int_arg_2=11;
+    repeated int32 rep_int_arg_3=12;
+    float float_arg_1=13;
+    bool bool_arg_1=14;
+    string string_arg_1=15;
+}

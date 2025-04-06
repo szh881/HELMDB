@@ -25,7 +25,7 @@ FetchContent_MakeAvailable(googletest)
 
 # ---- Create binary ----
 
-file(GLOB_RECURSE sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+file(GLOB_RECURSE sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/*.cc")
 
 add_executable(NVMDBTests ${headers} ${sources} ${nvm_core_src_list})
 target_include_directories(NVMDBTests PUBLIC ${nvm_core_inc_list} ${PROJECT_INCLUDE_DIR})
@@ -59,7 +59,7 @@ target_link_libraries(NVMDBTests PRIVATE glog gflags gtest gtest_main numa
         "-Wl,-R${SECUREDYNAMICLIB_HOME}" securec
         "-Wl,-R${TBB_LIB_PATH}" tbb
         ${CMAKE_DL_LIBS} pmemobj pmem
-        stdc++fs ndctl daxctl pthread)
+        stdc++fs ndctl daxctl pthread zmq protobuf)
 
 # "-l:libtbb.so.12.11"
 target_compile_options(NVMDBTests PRIVATE ${nvm_core_COMPILE_OPTIONS})

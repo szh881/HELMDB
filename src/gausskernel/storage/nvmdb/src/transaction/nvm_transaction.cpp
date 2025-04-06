@@ -88,9 +88,11 @@ TMResult Transaction::VersionIsVisible(const NVMTuple& tuple) const {
     if (TxInfoIsCSN(tuple.m_txInfo)) {
         committed = true;
         version_csn = tuple.m_txInfo;
+        // LOG(ERROR) <<"version_csn: "<<version_csn<<" m_snapshotCSN: "<<m_snapshotCSN;
     } else {
         TransactionInfo txInfo{};   // 返回m_txInfo 对应的事务的提交状态和CSN
         bool recycled = !GetTransactionInfo((TxSlotPtr)tuple.m_txInfo, &txInfo);
+        // LOG(ERROR) << "recycled: " << recycled;
         if (recycled) {
             /* fill MIN_SNAPSHOT back to txInfo as upper commit CSN. */
             return TMResult::OK;
@@ -102,6 +104,7 @@ TMResult Transaction::VersionIsVisible(const NVMTuple& tuple) const {
             case TxSlotStatus::COMMITTED:
                 committed = true;
                 version_csn = txInfo.csn;
+                // LOG(ERROR) << "version_csn: " << version_csn << " m_snapshotCSN: " << m_snapshotCSN;
                 break;
             case TxSlotStatus::IN_PROGRESS:
                 committed = false;
@@ -116,12 +119,14 @@ TMResult Transaction::VersionIsVisible(const NVMTuple& tuple) const {
         if (version_csn < m_snapshotCSN) {
             return TMResult::OK;
         }
+        // LOG(ERROR) << "TMResult::INVISIBLE version_csn: " << version_csn << " m_snapshotCSN: " << m_snapshotCSN;
         return TMResult::INVISIBLE; // 版本不可见
     }
     // 对应事务没有提交
     if (m_undoTxContext != nullptr && tuple.m_txInfo == m_txSlotPtr) {
         return TMResult::SELF_UPDATED;  // 自己更新自己
     }
+    // LOG(ERROR) << "TMResult::BEING_MODIFIED version_csn: " << version_csn << " m_snapshotCSN: " << m_snapshotCSN;
     return TMResult::BEING_MODIFIED;    // 冲突
 }
 
